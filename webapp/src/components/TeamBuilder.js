@@ -1,6 +1,14 @@
 import React from "react";
 
-export default function TeamBuilder({ label, players, setPlayers, rotation, setRotation, knownPlayers }) {
+export default function TeamBuilder({
+  label,
+  players,
+  setPlayers,
+  rotation,
+  setRotation,
+  knownPlayers = [],
+  knownBowlers = [],
+}) {
   const handlePlayerChange = (index, value) => {
     const newPlayers = [...players];
     newPlayers[index] = value;
@@ -24,7 +32,7 @@ export default function TeamBuilder({ label, players, setPlayers, rotation, setR
   const autofillRotation = () => {
     // Collect non-empty players in lineup or fallback to known batters/bowlers
     const activeLineup = players.filter(Boolean);
-    const pool = activeLineup.length >= 3 ? activeLineup : (knownPlayers.length ? knownPlayers : ["Bowler A", "Bowler B", "Bowler C"]);
+    const pool = activeLineup.length >= 3 ? activeLineup : (knownBowlers.length ? knownBowlers : ["Bowler A", "Bowler B", "Bowler C"]);
     const newRot = Array(20).fill("").map(() => pool[Math.floor(Math.random() * pool.length)]);
     setRotation(newRot);
   };
@@ -91,14 +99,14 @@ export default function TeamBuilder({ label, players, setPlayers, rotation, setR
                 <span style={{ minWidth: "45px", fontSize: "0.85rem", color: "#64748b", fontWeight: 600 }}>
                   Over {idx + 1}
                 </span>
-                {knownPlayers.length ? (
+                {knownBowlers.length ? (
                   <select
                     value={b}
                     onChange={(e) => handleRotationChange(idx, e.target.value)}
                     style={{ flexGrow: 1, padding: "5px", borderRadius: "6px", backgroundColor: "#0f172a", border: "1px solid #334155", color: "#e2e8f0", fontSize: "0.85rem" }}
                   >
                     <option value="">— select bowler —</option>
-                    {knownPlayers.map((name) => (
+                    {knownBowlers.map((name) => (
                       <option key={name} value={name}>{name}</option>
                     ))}
                   </select>

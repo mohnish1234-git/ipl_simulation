@@ -32,6 +32,8 @@ input, select, textarea {
 }
 input:focus, select:focus { border-color: #3b82f6; }
 .field { margin-bottom: .75rem; }
+.meta-status { color: #94a3b8; font-size: 0.85rem; margin: -0.25rem 0 1rem; }
+.meta-status.warning { color: #fbbf24; }
 
 /* Buttons */
 .btn { padding: 10px 20px; border-radius: 8px; border: none; cursor: pointer; font-size: 0.9rem; font-weight: 600; transition: all .2s; }

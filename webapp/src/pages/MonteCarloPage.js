@@ -8,7 +8,7 @@ const blank11 = () => Array(11).fill("");
 const blank20 = () => Array(20).fill("");
 
 export default function MonteCarloPage() {
-  const { meta } = useMeta();
+  const { meta, loading: metaLoading, error: metaError } = useMeta();
 
   const [team1, setTeam1]   = useState("Mumbai Indians");
   const [team2, setTeam2]   = useState("Chennai Super Kings");
@@ -50,6 +50,8 @@ export default function MonteCarloPage() {
 
       <div className="card">
         <h2>Setup</h2>
+        {metaLoading && <p className="meta-status">Loading dropdown options...</p>}
+        {metaError && <p className="meta-status warning">Using manual inputs because metadata could not be loaded.</p>}
         <div className="grid-3">
           <div className="field">
             <label>Team 1</label>
@@ -82,8 +84,8 @@ export default function MonteCarloPage() {
       </div>
 
       <div className="grid-2">
-        <TeamBuilder label={`${team1}`} players={order1} setPlayers={setOrder1} rotation={rot1} setRotation={setRot1} knownPlayers={meta.batters || []} />
-        <TeamBuilder label={`${team2}`} players={order2} setPlayers={setOrder2} rotation={rot2} setRotation={setRot2} knownPlayers={meta.batters || []} />
+        <TeamBuilder label={`${team1}`} players={order1} setPlayers={setOrder1} rotation={rot1} setRotation={setRot1} knownPlayers={meta.batters || []} knownBowlers={meta.bowlers || []} />
+        <TeamBuilder label={`${team2}`} players={order2} setPlayers={setOrder2} rotation={rot2} setRotation={setRot2} knownPlayers={meta.batters || []} knownBowlers={meta.bowlers || []} />
       </div>
 
       <button className="btn btn-primary" onClick={handleRun} disabled={loading} style={{ marginBottom: "1.5rem" }}>
