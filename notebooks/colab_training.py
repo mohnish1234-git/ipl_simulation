@@ -53,6 +53,14 @@ NUMERICAL = [
     "bowl_pp_rw_economy", "bowl_mid_rw_economy", "bowl_death_rw_economy",
     "bowl_pp_rw_wicket_pct", "bowl_death_rw_wicket_pct",
 
+    # ── player-at-venue interaction — HIGHEST precedence tier ────────────────
+    # These were being computed by feature_engineer.py (shrunk toward career
+    # stats, K=15) but were previously missing from this list entirely, so
+    # the model never actually trained on them. Adding them now is what makes
+    # the venue-precedence idea real rather than cosmetic.
+    "bat_venue_adj_sr", "bat_venue_adj_boundary_pct", "bat_venue_rw_balls",
+    "bowl_venue_adj_economy", "bowl_venue_adj_wicket_pct", "bowl_venue_rw_balls",
+
     # ── batter-vs-bowler matchup ─────────────────────────────────────────────
     "bvb_balls", "bvb_rw_sr", "bvb_rw_dismissal_pct",
     "bvb_rw_dot_pct", "bvb_rw_boundary_pct", "bvb_rw_six_pct",
@@ -163,6 +171,14 @@ if w_train is not None:
 # - `scale_pos_weight` not needed (multi-class); class imbalance handled via weights
 # - `max_depth=8` to capture more complex context interactions
 # - `subsample=0.7` + `colsample_bytree=0.7` for better generalisation with many features
+# - `early_stopping_rounds=40` — THIS WAS MISSING BEFORE. With n_estimators=600
+#   and no early stopping, the model kept training all 600 rounds even after
+#   validation logloss bottomed out (~round 100) and started climbing again —
+#   classic overfitting. The final saved model was the round-600 (most
+#   overfit) checkpoint, not the best one. early_stopping_rounds=40 means
+#   training stops once validation logloss hasn't improved for 40 rounds in
+#   a row, and model.best_iteration tells us exactly which round was best —
+#   used in Cell 12 to export ONLY the good trees, not the overfit tail.
 
 # %%
 model = XGBClassifier(
@@ -175,8 +191,8 @@ model = XGBClassifier(
     gamma=0.1,
     reg_alpha=0.05,
     reg_lambda=1.0,
-    use_label_encoder=False,
     eval_metric="mlogloss",
+    early_stopping_rounds=40,     # ← stops training once val loss stalls/worsens
     random_state=42,
     n_jobs=-1,
     tree_method="hist",           # switch to "gpu_hist" if GPU runtime is enabled
@@ -188,6 +204,13 @@ model.fit(
     eval_set=[(X_val, y_val)],
     verbose=50,
 )
+
+print(f"\nBest iteration: {model.best_iteration}  "
+      f"(out of {model.get_booster().num_boosted_rounds()} trained)")
+print(f"Best validation mlogloss: {model.best_score:.5f}")
+if model.best_iteration < model.get_booster().num_boosted_rounds() - 1:
+    print("Training stopped early — the tail rounds were overfitting and "
+          "have been discarded automatically.")
 
 # %% [markdown]
 # ## Cell 9 — Evaluate
@@ -227,14 +250,29 @@ for i, row in enumerate(proba):
 
 # %% [markdown]
 # ## Cell 12 — Export model files
+#
+# Exports the booster SLICED to best_iteration — this is the fix that
+# actually matters. Without it, even with early_stopping_rounds set above,
+# joblib.dump(model, ...) would still pickle every tree trained (XGBoost
+# keeps them all in memory for the eval_set curve), including the overfit
+# tail past best_iteration. Slicing the booster is what makes the exported
+# model match the checkpoint that actually had the best validation logloss.
+#
+# Also saves as JSON (not just pickle) — predictor.py already expects
+# ipl_ball_model.json for cross-version portability; this is the model
+# format it actually loads.
 
 # %%
-joblib.dump(model,          "ipl_ball_model.pkl",    compress=3)
+best_booster = model.get_booster()[: model.best_iteration + 1]
+best_booster.save_model("ipl_ball_model.json")
+
+joblib.dump(model,          "ipl_ball_model.pkl",    compress=3)   # legacy/backup only
 joblib.dump(label_encoders, "label_encoders.pkl",    compress=3)
 joblib.dump(ALL_FEATURES,   "feature_columns.pkl")
 
 print("Saved:")
-print("  ipl_ball_model.pkl")
+print(f"  ipl_ball_model.json   (booster sliced to best_iteration={model.best_iteration})")
+print("  ipl_ball_model.pkl    (legacy — predictor.py prefers the .json above)")
 print("  label_encoders.pkl")
 print("  feature_columns.pkl")
 
@@ -244,6 +282,7 @@ print("  feature_columns.pkl")
 # %%
 try:
     from google.colab import files
+    files.download("ipl_ball_model.json")
     files.download("ipl_ball_model.pkl")
     files.download("label_encoders.pkl")
     files.download("feature_columns.pkl")
@@ -256,8 +295,10 @@ except ImportError:
 
 # %%
 import joblib, numpy as np, pandas as pd
+import xgboost as xgb
 
-model_ck    = joblib.load("ipl_ball_model.pkl")
+booster_ck  = xgb.Booster()
+booster_ck.load_model("ipl_ball_model.json")   # the best_iteration-sliced model
 encoders_ck = joblib.load("label_encoders.pkl")
 feat_cols   = joblib.load("feature_columns.pkl")
 
@@ -297,6 +338,9 @@ test_ctx = {
     "bowl_rw_dot_pct": 0.38, "bowl_rw_boundary_pct": 0.12,
     "bowl_pp_rw_economy": 6.5, "bowl_mid_rw_economy": 7.0, "bowl_death_rw_economy": 8.1,
     "bowl_pp_rw_wicket_pct": 0.10, "bowl_death_rw_wicket_pct": 0.08,
+    # player-at-venue (highest precedence tier)
+    "bat_venue_adj_sr": 152.0, "bat_venue_adj_boundary_pct": 0.23, "bat_venue_rw_balls": 64.0,
+    "bowl_venue_adj_economy": 8.6, "bowl_venue_adj_wicket_pct": 0.05, "bowl_venue_rw_balls": 48.0,
     # matchup
     "bvb_balls": 42, "bvb_rw_sr": 128.0, "bvb_rw_dismissal_pct": 0.07,
     "bvb_rw_dot_pct": 0.35, "bvb_rw_boundary_pct": 0.17, "bvb_rw_six_pct": 0.07,
@@ -322,7 +366,7 @@ X_t = pd.DataFrame([row])
 # keep only the columns the model knows
 X_t = X_t.reindex(columns=feat_cols, fill_value=0)
 
-probs  = model_ck.predict_proba(X_t)[0]
+probs  = booster_ck.predict(xgb.DMatrix(X_t, feature_names=feat_cols))[0]
 labels = encoders_ck["outcome"].classes_
 
 print("Ball outcome probabilities (Kohli vs Bumrah, death, chasing 34 off 15):")

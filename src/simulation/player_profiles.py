@@ -25,8 +25,11 @@ Why this exists (and why it's NOT duplicating what XGBoost already learns):
     move a few percentage points of probability at most.
 """
 
+from dataclasses import dataclass
 from enum import Enum
-from typing import Dict
+from typing import Dict, Optional
+
+import numpy as np
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -47,10 +50,61 @@ class BowlerArchetype(Enum):
     ALL_PHASE  = "all_phase"
 
 
-def classify_batter(stats: dict) -> BatterArchetype:
+# ─────────────────────────────────────────────────────────────────────────────
+# Data-driven archetype thresholds
+#
+# Hardcoded absolute cutoffs (e.g. "SR <= 118 is an Anchor") silently assume a
+# specific league-wide scoring distribution. If the real distribution doesn't
+# match — which it won't, since T20 scoring has climbed significantly over
+# the years — an asymmetric pair of cutoffs (easy to trigger Anchor, hard to
+# trigger Aggressive) quietly classifies most of the player pool as low-risk
+# and almost none as high-risk. Applied on every ball of every innings, that
+# one-sided skew is enough to drag simulated totals well below realistic
+# scores. Fitting the cutoffs to percentiles of the ACTUAL loaded player pool
+# guarantees each archetype gets a comparable share of players regardless of
+# how the league's scoring has moved, and keeps risk roughly zero-mean overall.
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class ArchetypeThresholds:
+    sr_p25:        float = 118.0
+    sr_p75:        float = 145.0
+    boundary6_p75: float = 0.22
+    dot_p75:       float = 0.36
+    jump_p75:      float = 25.0
+
+
+def fit_archetype_thresholds(batter_pool: Dict[str, dict]) -> ArchetypeThresholds:
+    """Call once after loading player_batter_stats.json (e.g. in
+    StatsStore.load_from_csv) and reuse the result for every classify_batter()
+    call — refitting per-ball would be wasteful and pointless since the pool
+    doesn't change mid-match."""
+    if len(batter_pool) < 8:          # too few players for percentiles to mean anything
+        return ArchetypeThresholds()
+
+    srs       = np.array([s.get("bat_rw_sr", 128.0) for s in batter_pool.values()])
+    boundary6 = np.array([s.get("bat_rw_boundary_pct", 0.15) + s.get("bat_rw_six_pct", 0.06)
+                           for s in batter_pool.values()])
+    dots      = np.array([s.get("bat_rw_dot_pct", 0.33) for s in batter_pool.values()])
+    jumps     = np.array([s.get("bat_death_rw_sr", s.get("bat_rw_sr", 128.0)) - s.get("bat_rw_sr", 128.0)
+                           for s in batter_pool.values()])
+
+    return ArchetypeThresholds(
+        sr_p25=float(np.percentile(srs, 25)),
+        sr_p75=float(np.percentile(srs, 75)),
+        boundary6_p75=float(np.percentile(boundary6, 75)),
+        dot_p75=float(np.percentile(dots, 75)),
+        jump_p75=float(np.percentile(jumps, 75)),
+    )
+
+
+def classify_batter(stats: dict, thresholds: Optional[ArchetypeThresholds] = None) -> BatterArchetype:
     """Classifies from recency-weighted career stats already in StatsStore —
     same numbers the model sees, just used to derive a trait the model
-    never had access to."""
+    never had access to. Thresholds should come from fit_archetype_thresholds()
+    on the real player pool; falls back to broad defaults if not supplied."""
+    t = thresholds or ArchetypeThresholds()
+
     sr           = stats.get("bat_rw_sr", 128.0)
     boundary_pct = stats.get("bat_rw_boundary_pct", 0.15)
     six_pct      = stats.get("bat_rw_six_pct", 0.06)
@@ -58,13 +112,13 @@ def classify_batter(stats: dict) -> BatterArchetype:
     dot_pct      = stats.get("bat_rw_dot_pct", 0.33)
 
     # Finisher: strike rate jumps sharply specifically in death overs
-    if (death_sr - sr) > 25 and six_pct >= 0.06:
+    if (death_sr - sr) >= t.jump_p75 and six_pct >= 0.06:
         return BatterArchetype.FINISHER
-    # Aggressive: high SR everywhere, high combined boundary rate
-    if sr >= 145 and (boundary_pct + six_pct) >= 0.22:
+    # Aggressive: top quartile SR + top quartile combined boundary rate
+    if sr >= t.sr_p75 and (boundary_pct + six_pct) >= t.boundary6_p75:
         return BatterArchetype.AGGRESSIVE
-    # Anchor: happy to absorb dots, low six-hitting, moderate-low SR
-    if sr <= 118 and dot_pct >= 0.36 and six_pct < 0.05:
+    # Anchor: bottom quartile SR + top quartile dot tolerance, low six-hitting
+    if sr <= t.sr_p25 and dot_pct >= t.dot_p75 and six_pct < 0.05:
         return BatterArchetype.ANCHOR
     return BatterArchetype.ACCUMULATOR
 
@@ -113,17 +167,25 @@ def is_settled(archetype: BatterArchetype, balls_faced_this_innings: int) -> boo
 # ═══════════════════════════════════════════════════════════════════════════
 
 def venue_bowler_synergy(venue_stats: dict, bowler_archetype: BowlerArchetype) -> float:
-    """Small bounded risk delta (negative = favours the bowler) when a venue's
-    known character matches a bowler's specialism — a batter/bowler-archetype x
-    venue interaction the model can't see because archetype isn't a feature."""
+    """Small bounded risk delta (negative = favours the bowler, positive =
+    favours the batter) when a venue's known character does or doesn't match
+    a bowler's specialism — a batter/bowler-archetype x venue interaction the
+    model can't see because archetype isn't a feature.
+
+    Symmetric by construction: a venue that suits a specialist hurts the
+    batter, and a venue that DOESN'T suit that specialist should help the
+    batter by roughly the same amount. A one-directional version of this
+    (only ever penalising, never rewarding) creates a league-wide downward
+    bias in every simulated match regardless of venue — that was a bug in
+    an earlier version of this function."""
     wicket_pct = venue_stats.get("venue_rw_wicket_pct", 0.054)
     death_sr   = venue_stats.get("venue_rw_death_sr", 165.0)
 
     delta = 0.0
-    if bowler_archetype == BowlerArchetype.SPINNER and wicket_pct >= 0.06:
-        delta -= 0.05   # turning/wicket-taking venue suits a specialist spinner
-    if bowler_archetype == BowlerArchetype.DEATH and death_sr <= 155:
-        delta -= 0.05   # venue where death overs are historically contained
+    if bowler_archetype == BowlerArchetype.SPINNER:
+        delta += -0.05 if wicket_pct >= 0.06 else 0.05
+    if bowler_archetype == BowlerArchetype.DEATH:
+        delta += -0.05 if death_sr <= 155 else 0.05
     return delta
 
 
@@ -143,13 +205,18 @@ def compute_risk_index(
 ) -> float:
     """Returns a bounded aggression signal in [-1, 1]. Positive = batter is
     taking on more risk than their raw stats alone imply; negative = playing
-    it safer. Feeds into apply_risk_adjustment() below."""
+    it safer. Feeds into apply_risk_adjustment() below.
+
+    Baselines are magnitude-symmetric (+0.25 / -0.25) by design: combined with
+    percentile-based archetype thresholds (roughly equal-sized Aggressive and
+    Anchor populations), this keeps the average risk across a full team close
+    to zero rather than systematically dragging every simulated innings down."""
 
     settled = is_settled(archetype, balls_faced_this_innings)
     partner_recently_dismissed = partnership_balls < 3   # fresh, unsettled pair
 
     risk = {
-        BatterArchetype.AGGRESSIVE:   0.35,
+        BatterArchetype.AGGRESSIVE:   0.25,
         BatterArchetype.FINISHER:     0.15,
         BatterArchetype.ACCUMULATOR:  0.0,
         BatterArchetype.ANCHOR:      -0.25,

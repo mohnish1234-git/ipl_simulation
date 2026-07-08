@@ -10,17 +10,17 @@ const blank20 = () => Array(20).fill("");
 export default function SimulatePage() {
   const { meta, loading: metaLoading, error: metaError } = useMeta();
 
-  const [team1, setTeam1]   = useState("Mumbai Indians");
-  const [team2, setTeam2]   = useState("Chennai Super Kings");
-  const [venue, setVenue]   = useState("");
+  const [team1, setTeam1] = useState("Mumbai Indians");
+  const [team2, setTeam2] = useState("Chennai Super Kings");
+  const [venue, setVenue] = useState("");
   const [order1, setOrder1] = useState(blank11());
   const [order2, setOrder2] = useState(blank11());
-  const [rot1, setRot1]     = useState(blank20());
-  const [rot2, setRot2]     = useState(blank20());
+  const [rot1, setRot1] = useState(blank20());
+  const [rot2, setRot2] = useState(blank20());
 
-  const [result, setResult]   = useState(null);
+  const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
-  const [error, setError]     = useState("");
+  const [error, setError] = useState("");
 
   const handleSimulate = async () => {
     setLoading(true); setError(""); setResult(null);
@@ -80,8 +80,20 @@ export default function SimulatePage() {
 
       {/* Team builders */}
       <div className="grid-2">
-        <TeamBuilder label={`${team1} — Squad`} players={order1} setPlayers={setOrder1} rotation={rot1} setRotation={setRot1} knownPlayers={meta.batters || []} knownBowlers={meta.bowlers || []} />
-        <TeamBuilder label={`${team2} — Squad`} players={order2} setPlayers={setOrder2} rotation={rot2} setRotation={setRot2} knownPlayers={meta.batters || []} knownBowlers={meta.bowlers || []} />
+        <TeamBuilder
+          label={`${team1} — Squad`}
+          players={order1} setPlayers={setOrder1}
+          rotation={rot1} setRotation={setRot1}
+          knownPlayers={meta.batters_by_team?.[team1] ?? meta.active_batters ?? meta.batters ?? []}
+          knownBowlers={meta.bowlers_by_team?.[team1] ?? meta.active_bowlers ?? meta.bowlers ?? []}
+        />
+        <TeamBuilder
+          label={`${team2} — Squad`}
+          players={order2} setPlayers={setOrder2}
+          rotation={rot2} setRotation={setRot2}
+          knownPlayers={meta.batters_by_team?.[team2] ?? meta.active_batters ?? meta.batters ?? []}
+          knownBowlers={meta.bowlers_by_team?.[team2] ?? meta.active_bowlers ?? meta.bowlers ?? []}
+        />
       </div>
 
       <button className="btn btn-primary" onClick={handleSimulate} disabled={loading} style={{ marginBottom: "1.5rem" }}>

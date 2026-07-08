@@ -17,6 +17,7 @@ Outputs:
 
 import sys, json
 from pathlib import Path
+from typing import Dict
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -26,6 +27,11 @@ from src.data.cleaner        import load_raw, clean
 from src.data.feature_engineer import (
     build_features, _rw_agg,
     HALF_LIFE_SEASONS,
+    PLAYER_VENUE_SHRINK_K, BVB_DISMISSAL_SHRINK_K, BVB_OTHER_SHRINK_K,
+)
+from src.model.retirement_filter import (
+    compute_active_players,
+    ACTIVE_WINDOW_SEASONS,
 )
 
 RAW_PATH      = Path("data/raw/ipl_final.csv")
@@ -49,11 +55,21 @@ def main():
     df_feat.to_csv(PROCESSED_DIR / "features.csv", index=False)
     print(f"  Saved → data/processed/features.csv")
 
+    # NOTE: active_players is used only to scope which names the SIMULATOR/UI
+    # can select — it does NOT drop rows from training data. The model still
+    # trains on the full history (recency weighting already handles staleness
+    # there); we just stop retired/unaffiliated players from being pickable
+    # in a lineup at simulation time, which is what was producing Frankenstein
+    # XIs (e.g. a CSK legend or a specialist bowler slotted into an MI top 7).
+    active_players = compute_active_players(df_clean, window_seasons=ACTIVE_WINDOW_SEASONS)
+    print(f"\n  {len(active_players)} players considered active "
+          f"(appeared in the last {ACTIVE_WINDOW_SEASONS} seasons)")
+
     print("\nStep 4: Exporting lookup tables for the simulator …")
-    _export_lookup_tables(df_clean)
+    _export_lookup_tables(df_clean, active_players)
 
     print("\nStep 5: Building meta.json …")
-    _export_meta(df_clean)
+    _export_meta(df_clean, active_players)
 
     print("\n" + "=" * 55)
     print("Data preparation complete.")
@@ -62,15 +78,22 @@ def main():
 
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _export_lookup_tables(df: pd.DataFrame):
+def _export_lookup_tables(df: pd.DataFrame, active_players: set):
     """
     Export pre-computed recency-weighted stats as JSON files.
     The MatchSimulator StatsStore.load_from_csv() reads these at runtime.
+
+    Only ACTIVE players are exported here — this is what the simulator's
+    dropdowns/rosters draw from, so retired players (and one-off names with
+    no recent appearances) simply can't be selected into a lineup anymore.
+    Training itself (features.csv above) still uses the full history.
     """
 
     # ── batter career stats ───────────────────────────────────────────────────
     batter_stats = {}
     for name, grp in df.groupby("striker"):
+        if name not in active_players:
+            continue
         agg = _rw_agg(grp)
         if not agg:
             continue
@@ -99,6 +122,8 @@ def _export_lookup_tables(df: pd.DataFrame):
     # ── bowler career stats ───────────────────────────────────────────────────
     bowler_stats = {}
     for name, grp in df.groupby("bowler"):
+        if name not in active_players:
+            continue
         agg   = _rw_agg(grp)
         if not agg:
             continue
@@ -123,26 +148,105 @@ def _export_lookup_tables(df: pd.DataFrame):
     print(f"  player_bowler_stats.json ({len(bowler_stats)} bowlers)")
 
     # ── batter-vs-bowler matchup stats ───────────────────────────────────────
+    # Precedence: dismissal/wicket column shrinks toward the bowler's own
+    # career wicket_pct at BVB_DISMISSAL_SHRINK_K (some real weight, sooner);
+    # everything else shrinks toward the batter's own career number at the
+    # slower BVB_OTHER_SHRINK_K (lowest precedence of the three tiers).
+    # Previously matchups under 6 balls were dropped outright, which meant
+    # the simulator fell back to StatsStore.DEFAULT_BVB — a global league
+    # constant — instead of THIS batter's own real career numbers. Now every
+    # matchup with at least 1 ball is exported, correctly shrunk, so a thin
+    # matchup still reflects the specific player, just mostly via their
+    # career stat rather than the noisy 1-2 ball matchup number.
     bvb_stats = {}
     for (batter, bowler), grp in df.groupby(["striker", "bowler"]):
-        if len(grp) < 6:
+        if batter not in active_players or bowler not in active_players:
             continue
         agg = _rw_agg(grp)
         if not agg:
             continue
+        balls = agg["rw_balls"]
+        batter_career = batter_stats.get(batter, {})
+        bowler_career = bowler_stats.get(bowler, {})
+
+        shrink_dismissal = balls / (balls + BVB_DISMISSAL_SHRINK_K)
+        shrink_other      = balls / (balls + BVB_OTHER_SHRINK_K)
+
         key = f"{batter}|||{bowler}"
         bvb_stats[key] = {
-            "bvb_balls":            int(len(grp)),
-            "bvb_rw_sr":            round(agg.get("rw_sr", 120), 4),
-            "bvb_rw_dismissal_pct": round(agg.get("rw_wicket_pct", 0.055), 4),
-            "bvb_rw_dot_pct":       round(agg.get("rw_dot_pct", 0.33), 4),
-            "bvb_rw_boundary_pct":  round(agg.get("rw_boundary_pct", 0.15), 4),
-            "bvb_rw_six_pct":       round(agg.get("rw_six_pct", 0.06), 4),
+            "bvb_balls": int(len(grp)),
+            "bvb_rw_dismissal_pct": round(
+                shrink_dismissal * agg.get("rw_wicket_pct", 0.055)
+                + (1 - shrink_dismissal) * bowler_career.get("bowl_rw_wicket_pct", 0.055), 4),
+            "bvb_rw_sr": round(
+                shrink_other * agg.get("rw_sr", 120)
+                + (1 - shrink_other) * batter_career.get("bat_rw_sr", 120), 4),
+            "bvb_rw_dot_pct": round(
+                shrink_other * agg.get("rw_dot_pct", 0.33)
+                + (1 - shrink_other) * batter_career.get("bat_rw_dot_pct", 0.33), 4),
+            "bvb_rw_boundary_pct": round(
+                shrink_other * agg.get("rw_boundary_pct", 0.15)
+                + (1 - shrink_other) * batter_career.get("bat_rw_boundary_pct", 0.15), 4),
+            "bvb_rw_six_pct": round(
+                shrink_other * agg.get("rw_six_pct", 0.06)
+                + (1 - shrink_other) * batter_career.get("bat_rw_six_pct", 0.06), 4),
         }
 
     with open(PROCESSED_DIR / "bvb_stats.json", "w") as f:
         json.dump(bvb_stats, f)
-    print(f"  bvb_stats.json ({len(bvb_stats)} matchups with ≥6 balls)")
+    print(f"  bvb_stats.json ({len(bvb_stats)} matchups, all shrunk toward career stats)")
+
+    # ── batter-at-venue / bowler-at-venue interaction stats ──────────────────
+    # Same shrinkage-toward-career-number idea as feature_engineer.py's
+    # _add_player_venue_features — kept as-of-today snapshots (not causal by
+    # season, since this is what's used to simulate a brand new future match).
+    # Uses the SAME K as training (PLAYER_VENUE_SHRINK_K) so live simulation
+    # trusts venue-specific data at exactly the rate the model was trained to
+    # expect — a mismatch here would quietly reintroduce train/serve skew.
+    K = PLAYER_VENUE_SHRINK_K
+    batter_venue_stats = {}
+    for (name, venue), grp in df.groupby(["striker", "venue"]):
+        if name not in active_players or len(grp) < 3:
+            continue
+        agg = _rw_agg(grp)
+        if not agg:
+            continue
+        career = batter_stats.get(name, {})
+        balls = agg["rw_balls"]
+        shrink = balls / (balls + K)
+        key = f"{name}|||{venue}"
+        batter_venue_stats[key] = {
+            "bat_venue_rw_balls": round(balls, 2),
+            "bat_venue_adj_sr": round(
+                shrink * agg["rw_sr"] + (1 - shrink) * career.get("bat_rw_sr", 120.0), 4),
+            "bat_venue_adj_boundary_pct": round(
+                shrink * agg["rw_boundary_pct"] + (1 - shrink) * career.get("bat_rw_boundary_pct", 0.15), 4),
+        }
+    with open(PROCESSED_DIR / "batter_venue_stats.json", "w") as f:
+        json.dump(batter_venue_stats, f)
+    print(f"  batter_venue_stats.json ({len(batter_venue_stats)} player-venue pairs)")
+
+    bowler_venue_stats = {}
+    for (name, venue), grp in df.groupby(["bowler", "venue"]):
+        if name not in active_players or len(grp) < 3:
+            continue
+        agg = _rw_agg(grp)
+        if not agg:
+            continue
+        career = bowler_stats.get(name, {})
+        balls = agg["rw_balls"]
+        shrink = balls / (balls + K)
+        key = f"{name}|||{venue}"
+        bowler_venue_stats[key] = {
+            "bowl_venue_rw_balls": round(balls, 2),
+            "bowl_venue_adj_economy": round(
+                shrink * agg["rw_economy"] + (1 - shrink) * career.get("bowl_rw_economy", 8.5), 4),
+            "bowl_venue_adj_wicket_pct": round(
+                shrink * agg["rw_wicket_pct"] + (1 - shrink) * career.get("bowl_rw_wicket_pct", 0.05), 4),
+        }
+    with open(PROCESSED_DIR / "bowler_venue_stats.json", "w") as f:
+        json.dump(bowler_venue_stats, f)
+    print(f"  bowler_venue_stats.json ({len(bowler_venue_stats)} player-venue pairs)")
 
     # ── venue stats ───────────────────────────────────────────────────────────
     venue_stats = {}
@@ -200,10 +304,35 @@ def _export_lookup_tables(df: pd.DataFrame):
     print(f"  venue_stats.json ({len(venue_stats)} venues)")
 
 
-def _export_meta(df: pd.DataFrame):
+def _export_meta(df: pd.DataFrame, active_players: set):
+    # Team-scoped rosters: which ACTIVE players have actually batted/bowled
+    # for each team historically. This is what fixes lineups like a CSK
+    # legend or a non-MI bowler showing up in an "MI" XI — the old
+    # meta.batters/meta.bowlers were a single unscoped historical pool.
+    batters_by_team: Dict[str, list] = {}
+    for team, grp in df.groupby("batting_team"):
+        batters_by_team[team] = sorted(
+            p for p in grp["striker"].dropna().unique() if p in active_players
+        )
+
+    bowlers_by_team: Dict[str, list] = {}
+    for team, grp in df.groupby("bowling_team"):
+        bowlers_by_team[team] = sorted(
+            p for p in grp["bowler"].dropna().unique() if p in active_players
+        )
+
     meta = {
+        # kept for backwards compatibility — DO NOT use these for lineup
+        # dropdowns anymore, they mix every team and every era. Use
+        # batters_by_team / bowlers_by_team instead.
         "batters":  sorted(df["striker"].dropna().unique().tolist()),
         "bowlers":  sorted(df["bowler"].dropna().unique().tolist()),
+
+        "active_batters":  sorted(p for p in df["striker"].dropna().unique() if p in active_players),
+        "active_bowlers":  sorted(p for p in df["bowler"].dropna().unique() if p in active_players),
+        "batters_by_team": batters_by_team,
+        "bowlers_by_team": bowlers_by_team,
+
         "teams":    sorted(df["batting_team"].dropna().unique().tolist()),
         "venues":   sorted(df["venue"].dropna().unique().tolist()),
         "seasons":  sorted(int(x) for x in df["season"].dropna().unique().tolist()),
@@ -211,8 +340,8 @@ def _export_meta(df: pd.DataFrame):
     }
     with open(PROCESSED_DIR / "meta.json", "w") as f:
         json.dump(meta, f, indent=2)
-    print(f"  meta.json  ({len(meta['batters'])} batters | "
-          f"{len(meta['bowlers'])} bowlers | "
+    print(f"  meta.json  ({len(meta['active_batters'])} active batters | "
+          f"{len(meta['active_bowlers'])} active bowlers | "
           f"{len(meta['venues'])} venues)")
 
 
