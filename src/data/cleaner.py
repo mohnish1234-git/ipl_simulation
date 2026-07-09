@@ -7,9 +7,15 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 
+from .venue_mapping import filter_to_allowed_venues, print_unmapped_venues
 
 RAW_PATH = Path("data/raw/ipl_final.csv")
 PROCESSED_DIR = Path("data/processed")
+
+# Set True once, run prepare_data.py, read the printout, then set back to
+# False. Lets you see every raw venue string that didn't match one of the
+# 13 allowed grounds before you silently start dropping that data.
+DIAGNOSE_UNMAPPED_VENUES = False
 
 
 def load_raw(path: Path = RAW_PATH) -> pd.DataFrame:
@@ -63,9 +69,16 @@ def clean(df: pd.DataFrame) -> pd.DataFrame:
     decay_rate = np.log(2) / HALF_LIFE
     df["season_weight"] = np.exp(-decay_rate * (max_season - df["season"]))
 
-    # ── Fill missing strings ─────────────────────────────────────────────────
-    for col in ["venue", "batting_team", "bowling_team", "striker", "bowler"]:
+    # ── Fill missing strings (except venue — canonicalized/filtered next) ────
+    for col in ["batting_team", "bowling_team", "striker", "bowler"]:
         df[col] = df[col].fillna("Unknown").str.strip()
+
+    # ── Restrict to the 13 target venues ─────────────────────────────────────
+    # Run once with DIAGNOSE_UNMAPPED_VENUES=True to check for un-recognized
+    # spelling variants in your raw data before trusting this filter.
+    if DIAGNOSE_UNMAPPED_VENUES:
+        print_unmapped_venues(df, venue_col="venue")
+    df = filter_to_allowed_venues(df, venue_col="venue")
 
     # ── Drop deliveries with missing critical fields ─────────────────────────
     df.dropna(subset=["striker", "bowler", "innings", "over"], inplace=True)

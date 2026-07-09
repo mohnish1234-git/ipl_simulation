@@ -29,59 +29,214 @@ print(f"\nSample weight range: {df['sample_weight'].min():.4f} – {df['sample_w
 # All 7 feature groups are listed explicitly.
 # XGBoost learns which ones matter most — nothing is hardcoded.
 
-# %%
 CATEGORICAL = [
-    "striker", "bowler", "batting_team", "bowling_team", "venue", "phase",
+    "striker",
+    "bowler",
+    "batting_team",
+    "bowling_team",
+    "venue",
+    "phase",
 ]
 
 NUMERICAL = [
-    # ── basic match state ────────────────────────────────────────────────────
-    "over_num", "ball_num",
-    "cumulative_runs", "cumulative_wickets",
-    "balls_remaining", "wickets_remaining",
+    # ───────────────────────────────────────────────────────────────
+    # Match State
+    # ───────────────────────────────────────────────────────────────
+    "over_num",
+    "ball_num",
+    "cumulative_runs",
+    "cumulative_wickets",
+    "balls_remaining",
+    "wickets_remaining",
     "crr",
 
-    # ── recency-weighted career stats — batter ───────────────────────────────
-    "bat_rw_avg", "bat_rw_sr", "bat_rw_boundary_pct", "bat_rw_six_pct",
+    # ───────────────────────────────────────────────────────────────
+    # Batter Career
+    # ───────────────────────────────────────────────────────────────
+    "bat_rw_avg",
+    "bat_rw_sr",
+    "bat_rw_boundary_pct",
+    "bat_rw_six_pct",
     "bat_rw_dot_pct",
-    "bat_pp_rw_sr", "bat_mid_rw_sr", "bat_death_rw_sr",
-    "bat_pp_rw_boundary_pct", "bat_death_rw_boundary_pct",
 
-    # ── recency-weighted career stats — bowler ───────────────────────────────
-    "bowl_rw_economy", "bowl_rw_wicket_pct", "bowl_rw_dot_pct",
+    "bat_pp_rw_sr",
+    "bat_mid_rw_sr",
+    "bat_death_rw_sr",
+
+    "bat_pp_rw_boundary_pct",
+    "bat_mid_rw_boundary_pct",
+    "bat_death_rw_boundary_pct",
+
+    "bat_pp_rw_dot_pct",
+    "bat_mid_rw_dot_pct",
+    "bat_death_rw_dot_pct",
+
+    # ───────────────────────────────────────────────────────────────
+    # Bowler Career
+    # ───────────────────────────────────────────────────────────────
+    "bowl_rw_economy",
+    "bowl_rw_wicket_pct",
+    "bowl_rw_dot_pct",
     "bowl_rw_boundary_pct",
-    "bowl_pp_rw_economy", "bowl_mid_rw_economy", "bowl_death_rw_economy",
-    "bowl_pp_rw_wicket_pct", "bowl_death_rw_wicket_pct",
 
-    # ── player-at-venue interaction — HIGHEST precedence tier ────────────────
-    # These were being computed by feature_engineer.py (shrunk toward career
-    # stats, K=15) but were previously missing from this list entirely, so
-    # the model never actually trained on them. Adding them now is what makes
-    # the venue-precedence idea real rather than cosmetic.
-    "bat_venue_adj_sr", "bat_venue_adj_boundary_pct", "bat_venue_rw_balls",
-    "bowl_venue_adj_economy", "bowl_venue_adj_wicket_pct", "bowl_venue_rw_balls",
+    "bowl_pp_rw_economy",
+    "bowl_mid_rw_economy",
+    "bowl_death_rw_economy",
 
-    # ── batter-vs-bowler matchup ─────────────────────────────────────────────
-    "bvb_balls", "bvb_rw_sr", "bvb_rw_dismissal_pct",
-    "bvb_rw_dot_pct", "bvb_rw_boundary_pct", "bvb_rw_six_pct",
+    "bowl_pp_rw_wicket_pct",
+    "bowl_mid_rw_wicket_pct",
+    "bowl_death_rw_wicket_pct",
 
-    # ── in-match momentum ────────────────────────────────────────────────────
-    "batter_balls_faced", "batter_runs_scored", "batter_innings_sr",
-    "balls_vs_bowler", "runs_vs_bowler",
-    "runs_last6", "runs_last_over",
-    "consec_dots", "consec_boundaries",
-    "partnership_runs", "partnership_balls",
-    "prev_ball_outcome", "prev2_ball_outcome", "prev3_ball_outcome",
+    "bowl_pp_rw_dot_pct",
+    "bowl_mid_rw_dot_pct",
+    "bowl_death_rw_dot_pct",
 
-    # ── venue intelligence ───────────────────────────────────────────────────
-    "venue_rw_avg_1st_innings", "venue_rw_avg_2nd_innings",
-    "venue_rw_boundary_pct", "venue_rw_six_pct",
-    "venue_rw_dot_pct", "venue_rw_wicket_pct",
-    "venue_rw_pp_sr", "venue_rw_death_sr",
+    "bowl_pp_rw_boundary_pct",
+    "bowl_mid_rw_boundary_pct",
+    "bowl_death_rw_boundary_pct",
 
-    # ── batting context / pressure ───────────────────────────────────────────
-    "is_batting_first", "is_chasing",
-    "target", "runs_needed", "rrr", "pressure_index",
+    # ───────────────────────────────────────────────────────────────
+    # Batter @ Venue
+    # ───────────────────────────────────────────────────────────────
+    "bat_venue_adj_sr",
+    "bat_venue_adj_boundary_pct",
+    "bat_venue_rw_balls",
+
+    # ───────────────────────────────────────────────────────────────
+    # Bowler @ Venue
+    # ───────────────────────────────────────────────────────────────
+    "bowl_venue_adj_economy",
+    "bowl_venue_adj_wicket_pct",
+    "bowl_venue_rw_balls",
+
+    # ───────────────────────────────────────────────────────────────
+    # Batter vs Bowler
+    # ───────────────────────────────────────────────────────────────
+    "bvb_balls",
+    "bvb_rw_sr",
+    "bvb_rw_dismissal_pct",
+    "bvb_rw_dot_pct",
+    "bvb_rw_boundary_pct",
+    "bvb_rw_six_pct",
+
+    # ───────────────────────────────────────────────────────────────
+    # In-match Momentum
+    # ───────────────────────────────────────────────────────────────
+    "batter_balls_faced",
+    "batter_runs_scored",
+    "batter_innings_sr",
+
+    "balls_vs_bowler",
+    "runs_vs_bowler",
+
+    "runs_last6",
+    "runs_last12",
+    "runs_last18",
+    "runs_last_over",
+
+    "consec_dots",
+    "consec_boundaries",
+
+    "partnership_runs",
+    "partnership_balls",
+    "partnership_run_rate",
+
+    "current_matchup_sr",
+
+    "prev_ball_outcome",
+    "prev2_ball_outcome",
+    "prev3_ball_outcome",
+
+    # ───────────────────────────────────────────────────────────────
+    # Venue Intelligence
+    # ───────────────────────────────────────────────────────────────
+    "venue_rw_avg_1st_innings",
+    "venue_rw_avg_2nd_innings",
+
+    "venue_rw_boundary_pct",
+    "venue_rw_six_pct",
+    "venue_rw_dot_pct",
+    "venue_rw_wicket_pct",
+
+    "venue_rw_pp_sr",
+    "venue_rw_mid_sr",
+    "venue_rw_death_sr",
+
+    "venue_rw_pp_boundary_pct",
+    "venue_rw_mid_boundary_pct",
+    "venue_rw_death_boundary_pct",
+
+    "venue_rw_pp_wicket_pct",
+    "venue_rw_mid_wicket_pct",
+    "venue_rw_death_wicket_pct",
+
+    # ───────────────────────────────────────────────────────────────
+    # Venue Over-Band Features
+    # ───────────────────────────────────────────────────────────────
+    "venue_rw_1_6_rr",
+    "venue_rw_7_10_rr",
+    "venue_rw_11_15_rr",
+    "venue_rw_16_20_rr",
+
+    "venue_rw_1_6_wicket_pct",
+    "venue_rw_7_10_wicket_pct",
+    "venue_rw_11_15_wicket_pct",
+    "venue_rw_16_20_wicket_pct",
+
+    # ───────────────────────────────────────────────────────────────
+    # Batter @ Venue Over-Bands
+    # ───────────────────────────────────────────────────────────────
+    "bat_venue_1_6_sr",
+    "bat_venue_7_10_sr",
+    "bat_venue_11_15_sr",
+    "bat_venue_16_20_sr",
+
+    "bat_venue_1_6_avg",
+    "bat_venue_7_10_avg",
+    "bat_venue_11_15_avg",
+    "bat_venue_16_20_avg",
+
+    # ───────────────────────────────────────────────────────────────
+    # Bowler @ Venue Over-Bands
+    # ───────────────────────────────────────────────────────────────
+    "bowl_venue_1_6_economy",
+    "bowl_venue_7_10_economy",
+    "bowl_venue_11_15_economy",
+    "bowl_venue_16_20_economy",
+
+    "bowl_venue_1_6_wicket_pct",
+    "bowl_venue_7_10_wicket_pct",
+    "bowl_venue_11_15_wicket_pct",
+    "bowl_venue_16_20_wicket_pct",
+
+    # ───────────────────────────────────────────────────────────────
+    # Batter vs Bowler Over-Bands
+    # ───────────────────────────────────────────────────────────────
+    "bvb_1_6_sr",
+    "bvb_7_10_sr",
+    "bvb_11_15_sr",
+    "bvb_16_20_sr",
+
+    "bvb_1_6_avg",
+    "bvb_7_10_avg",
+    "bvb_11_15_avg",
+    "bvb_16_20_avg",
+
+    # ───────────────────────────────────────────────────────────────
+    # Batting Context / Pressure
+    # ───────────────────────────────────────────────────────────────
+    "is_batting_first",
+    "is_chasing",
+
+    "target",
+    "runs_needed",
+    "rrr",
+    "pressure_index",
+
+    "required_runs_per_wicket",
+    "balls_per_required_run",
+    "pressure_weighted_rrr",
+    "pressure_weighted_aggression",
 ]
 
 TARGET        = "outcome"
@@ -109,9 +264,9 @@ label_encoders = {}
 for col in CATEGORICAL:
     le = LabelEncoder()
     df[col] = df[col].fillna("Unknown").astype(str)
-    all_vals = list(df[col].unique()) + ["Unknown"]
-    le.fit(all_vals)
+    le.fit(list(df[col].unique()) + ["Unknown"])
     df[col] = le.transform(df[col])
+    df[col] = df[col].astype("category")      # ← add this line
     label_encoders[col] = le
     print(f"  {col}: {len(le.classes_)} classes")
 
@@ -193,6 +348,7 @@ model = XGBClassifier(
     reg_lambda=1.0,
     eval_metric="mlogloss",
     early_stopping_rounds=40,     # ← stops training once val loss stalls/worsens
+    enable_categorical=True, 
     random_state=42,
     n_jobs=-1,
     tree_method="hist",           # switch to "gpu_hist" if GPU runtime is enabled
@@ -363,10 +519,17 @@ test_ctx = {
 
 row = encode_row(test_ctx)
 X_t = pd.DataFrame([row])
-# keep only the columns the model knows
 X_t = X_t.reindex(columns=feat_cols, fill_value=0)
 
-probs  = booster_ck.predict(xgb.DMatrix(X_t, feature_names=feat_cols))[0]
+# cast the same categorical columns back to category dtype so this
+# matches what the booster was trained on
+for col in ["striker", "bowler", "batting_team", "bowling_team", "venue", "phase"]:
+    if col in X_t.columns:
+        X_t[col] = X_t[col].astype("category")
+
+probs  = booster_ck.predict(
+    xgb.DMatrix(X_t, feature_names=feat_cols, enable_categorical=True)   # ← add enable_categorical=True here too
+)[0]
 labels = encoders_ck["outcome"].classes_
 
 print("Ball outcome probabilities (Kohli vs Bumrah, death, chasing 34 off 15):")
