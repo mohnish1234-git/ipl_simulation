@@ -24,6 +24,58 @@ print(f"\nOutcome distribution:\n{df['outcome'].value_counts()}")
 print(f"\nSample weight range: {df['sample_weight'].min():.4f} – {df['sample_weight'].max():.4f}")
 
 # %% [markdown]
+# ## Cell 3b — Drop deliveries for retired/inactive players
+#
+# Mirrors src/model/retirement_filter.py EXACTLY (same ACTIVE_WINDOW_SEASONS,
+# same "active" definition, same mode="either" default) — inlined here rather
+# than imported since this script is meant to run standalone in Colab with
+# no repo checkout. If you ever change retirement_filter.py's constants or
+# logic, update this cell to match, or training and the serving-time active-
+# player list (used to validate a simulated squad and build the UI roster)
+# will silently drift apart.
+#
+# "either" keeps a row if AT LEAST ONE side (striker or bowler) is still
+# active — a retired batter's dismissal pattern against a currently-active
+# bowler is still informative for that bowler, even though we'll never
+# simulate that specific batter again. Only rows where BOTH sides are
+# retired get dropped. Rationale for doing this at all: every split the
+# tree spends learning fine-grained patterns for a player who can no longer
+# be selected in a simulation is training capacity that isn't going toward
+# players who WILL actually appear — this doesn't fix BvB sparsity (most
+# head-to-head pairs are thin regardless of retirement status; that's what
+# BVB_OTHER_SHRINK_K / BVB_DISMISSAL_SHRINK_K in feature_engineer.py are
+# for), it's a separate, complementary improvement.
+
+ACTIVE_WINDOW_SEASONS = 3   # keep in sync with retirement_filter.py
+
+def _compute_active_players(df, window_seasons=ACTIVE_WINDOW_SEASONS):
+    latest_season = df["season"].max()
+    cutoff_season = latest_season - window_seasons + 1
+    recent = df[df["season"] >= cutoff_season]
+    return set(recent["striker"].dropna().unique()) | set(recent["bowler"].dropna().unique())
+
+def _filter_to_active_players(df, active_players, mode="either"):
+    striker_active = df["striker"].isin(active_players)
+    bowler_active  = df["bowler"].isin(active_players)
+    keep = (striker_active | bowler_active) if mode == "either" else (striker_active & bowler_active)
+    before = len(df)
+    out = df[keep].copy()
+    print(f"Retirement filter ({mode}, last {ACTIVE_WINDOW_SEASONS} seasons): "
+          f"{before - len(out):,} rows removed, {len(out):,} remaining ({len(active_players)} active players)")
+    return out
+
+active_players = _compute_active_players(df, window_seasons=ACTIVE_WINDOW_SEASONS)
+df = _filter_to_active_players(df, active_players, mode="either")
+
+# Save alongside the other model artifacts so prepare_data.py / the live
+# simulator can load the SAME active-player set this model was trained
+# against, instead of recomputing it separately from a possibly different
+# snapshot of the data (that mismatch is exactly the kind of train/serve
+# skew this whole pipeline has been bitten by before).
+joblib.dump(sorted(active_players), "active_players.pkl")
+print(f"Saved active_players.pkl ({len(active_players)} players)")
+
+# %% [markdown]
 # ## Cell 4 — Define feature groups
 #
 # All 7 feature groups are listed explicitly.

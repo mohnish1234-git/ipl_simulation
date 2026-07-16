@@ -21,7 +21,13 @@ from typing import Dict, List
 
 from .calibration import load_calibrator, OutcomeCalibrator
 
-MODELS_DIR = Path("models")
+# Resolve relative to THIS file, not the process's current working directory.
+# predictor.py lives at src/model/predictor.py, so parent.parent.parent is the
+# project root. A bare Path("models") looked fine in testing but silently
+# breaks (and falls through to MockPredictor) the moment uvicorn/python is
+# launched from any directory other than the exact project root — no error,
+# just a quiet downgrade to the mock, which is very easy to miss in server logs.
+MODELS_DIR = Path(__file__).resolve().parent.parent.parent / "models"
 OUTCOMES   = ["0", "1", "2", "3", "4", "6", "W"]
 
 
@@ -45,6 +51,19 @@ class BallOutcomePredictor:
         self.encoders:     dict      = joblib.load(models_dir / "label_encoders.pkl")
         self.feature_cols: List[str] = joblib.load(models_dir / "feature_columns.pkl")
         self.label_encoder           = self.encoders.get("outcome")
+
+        # ── Guard against stale artifacts ───────────────────────────────────
+        # A previously-exported label_encoders.pkl (from before the outcome
+        # target was cleaned to 7 classes) can silently reintroduce a dead
+        # "5" class with real, non-trivial probability mass at inference
+        # time, even though '5' occurs in well under 0.1% of real deliveries.
+        # Fail loudly here instead of quietly corrupting every simulated ball.
+        expected = ["0", "1", "2", "3", "4", "6", "W"]
+        actual = list(self.label_encoder.classes_)
+        assert actual == expected, (
+            f"Stale label encoder — expected {expected}, got {actual}. "
+            f"Re-export label_encoders.pkl from your current training run."
+        )
 
         json_path = models_dir / "ipl_ball_model.json"
         pkl_path  = models_dir / "ipl_ball_model.pkl"
@@ -77,11 +96,23 @@ class BallOutcomePredictor:
             probs = self.model.predict_proba(X)[0]
 
         classes = self.label_encoder.classes_
-        result  = {cls: float(p) for cls, p in zip(classes, probs)}
+        # Filter to only the outcomes the simulator understands, then
+        # renormalize — a stray/legacy class in `classes` (see the assert
+        # in __init__) can no longer silently leak probability mass into
+        # the sampled distribution even if this guard is ever bypassed.
+        result = {cls: float(p) for cls, p in zip(classes, probs) if cls in OUTCOMES}
         for o in OUTCOMES:
             result.setdefault(o, 0.0)
+        total = sum(result.values())
+        if total > 0:
+            result = {k: v / total for k, v in result.items()}
+
         if self.calibrator is not None:
-            result = self.calibrator.calibrate(result)
+            # phase=... is a no-op for a flat OutcomeCalibrator and is what
+            # actually selects the right curve for a PhaseCalibrator — see
+            # calibration.py. Passing it unconditionally means this line
+            # doesn't need to change if/when the calibrator format changes.
+            result = self.calibrator.calibrate(result, phase=ball_context.get("phase"))
         return result
 
     def _encode_row(self, ctx: dict) -> dict:
@@ -137,8 +168,13 @@ class MockPredictor:
 
         # ── Pressure adjustment: chasing team behind the rate ─────────────────
         pressure = float(ball_context.get("pressure_index", 0.0))
-        if pressure > 4:          # very high pressure — more sixes/fours, more wickets
-            shift = min(pressure * 0.003, 0.025)
+        # Threshold/coefficient rescaled to match match_simulator.py's fix:
+        # pressure_index is now normalized by MODERN_PAR_RR (~8.6), so a
+        # "very high pressure" chase now reads as roughly 0.5+, not 4+ —
+        # these were tuned for the old, unnormalized (rrr - crr) scale and
+        # would have almost never fired against the corrected one.
+        if pressure > 0.5:        # very high pressure — more sixes/fours, more wickets
+            shift = min(pressure * 0.026, 0.025)
             base["4"] = min(base["4"] + shift, 0.22)
             base["6"] = min(base["6"] + shift, 0.15)
             base["0"] = max(base["0"] - shift, 0.15)
@@ -164,17 +200,38 @@ class MockPredictor:
         return {k: v / total for k, v in base.items()}
 
 
-def load_predictor(use_mock: bool = False, models_dir: Path = MODELS_DIR):
+def load_predictor(use_mock: bool = False, models_dir: Path = MODELS_DIR,
+                    allow_mock_fallback: bool = False):
+    """
+    By default this ONLY loads the real trained BallOutcomePredictor and
+    raises loudly if it can't — no silent MockPredictor degrade. That
+    previous behavior (broad except -> MockPredictor) is exactly what was
+    masking a real model-loading failure behind flat, venue-blind simulated
+    scores with nothing but an easy-to-miss console warning as a clue.
+
+    use_mock=True            : explicitly use MockPredictor (e.g. for fast
+                                local UI testing without a trained model).
+    allow_mock_fallback=True : restore the OLD silent-degrade behavior, if
+                                you deliberately want the API to stay up even
+                                when the real model can't load. Off by default.
+    """
     if use_mock:
-        print("Using MockPredictor (calibrated from real IPL data)")
+        print("Using MockPredictor (calibrated from real IPL data) — explicitly requested")
         return MockPredictor()
+
+    if not allow_mock_fallback:
+        # Let the real exception surface — this is the point. If this raises,
+        # models_dir, file names, or your local xgboost version need fixing;
+        # it should NOT be silently patched over by falling back to the mock.
+        predictor = BallOutcomePredictor(models_dir)
+        print(f"Predictor in use: {type(predictor).__name__} (real trained model)")
+        return predictor
+
     try:
-        return BallOutcomePredictor(models_dir)
+        predictor = BallOutcomePredictor(models_dir)
+        print(f"Predictor in use: {type(predictor).__name__} (real trained model)")
+        return predictor
     except Exception as e:
-        # Deliberately broad: a corrupt pickle, an XGBoost version mismatch,
-        # or any other load-time failure should degrade to MockPredictor
-        # rather than crashing the whole API on startup — but it prints
-        # loudly so this can't silently persist unnoticed like it did before.
         print(f"⚠  Model load failed ({type(e).__name__}: {e}) "
-              f"— using data-calibrated MockPredictor")
+              f"— using data-calibrated MockPredictor (allow_mock_fallback=True)")
         return MockPredictor()

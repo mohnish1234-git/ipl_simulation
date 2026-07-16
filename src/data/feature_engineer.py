@@ -40,6 +40,89 @@ OUTPUT_PATH  = Path("data/processed/features.csv")
 # something, just proportionally less as more recent data accumulates.
 HALF_LIFE_SEASONS = 3.0
 
+# Venue conditions (pitch behavior, boundary size effects, dew patterns) can
+# shift meaningfully in 1-2 seasons — a new drop-in pitch, a groundskeeper
+# change, or just T20 batting getting more aggressive league-wide. A 3-season
+# half-life (same as player stats) still lets a 2018 match meaningfully
+# influence today's number. Venue stats use a much shorter half-life instead,
+# so recent (2023+) seasons dominate almost completely — this is separate
+# from MODERN_ERA_MIN_SEASON below, which is a hard floor; this is a decay
+# rate on top of that floor.
+VENUE_HALF_LIFE_SEASONS = 1.0
+
+# On top of the decay above: the last 2 IPL seasons get an extra flat
+# multiplier for VENUE stats specifically (not player/bowler/BvB — a
+# ground's conditions this year matter far more to "how does this venue
+# play right now" than a player's 3-year rolling form does to "how good is
+# this player right now"). This is intentionally a strong push — recent
+# seasons should dominate a venue read more than the ordinary half-life
+# decay alone would give them, per the project's own priority on getting
+# current-conditions venue signal right for the Monte Carlo / fantasy-pick
+# use case. Paired with the shrinkage below so a boosted-but-thin recent
+# sample (e.g. a venue's first season) still gets pulled toward a sane
+# league prior rather than overfitting to 1-2 matches.
+RECENT_VENUE_SEASON_WINDOW = 2
+RECENT_VENUE_SEASON_BOOST  = 5.0
+
+# League-average par 1st/2nd-innings totals that venue_rw_avg_1st_innings /
+# venue_rw_avg_2nd_innings shrink toward at low sample size — same
+# rationale as BASE_RATE_PRIOR below, just for match-level innings totals
+# rather than per-ball rates (so it can't reuse that dict directly).
+# Modern-era (2018+) league-wide par scores; 2nd innings is slightly lower
+# than 1st on average across a mix of chases won/lost, small-sample venues,
+# and dew/pressure effects.
+VENUE_INNINGS_AVG_PRIOR = {"inn1": 168.0, "inn2": 162.0}
+VENUE_INNINGS_SHRINK_K  = 8.0   # in prior MATCHES (not balls) — a venue needs
+                                 # roughly 8 recency-weighted matches of history
+                                 # before its own average outweighs the prior.
+
+# Shrinkage constant (in weighted legal balls) for the BASE per-player rate
+# stats (bat_rw_sr, bat_{band}_rw_sr, bowl_rw_economy, bowl_{band}_rw_economy,
+# etc.) that prepare_data.py exports straight into StatsStore and that
+# player_profiles.py's archetype classifier reads with hard percentile
+# cutoffs. This was lost when the phase split (pp/mid/death) was rebuilt
+# into the finer 4-band split (1_6/7_10/11_15/16_20) below — re-added here,
+# and now MORE important than before: 4 bands means less data per bucket
+# than the old 3 phases had, so small-sample noise is even easier to hit.
+#
+# Every OTHER derived stat in this file already shrinks toward a prior in
+# proportion to sample size (see PLAYER_VENUE_SHRINK_K, BVB_*_SHRINK_K,
+# OVERBAND_SHRINK_K_* below) — these base rates are the one exception. A
+# rarely-used batter with only a handful of weighted legal balls in a given
+# band gets a raw, unshrunk rate straight off 1-2 boundary hits or
+# dismissals (e.g. SR 200+ off a dozen balls). player_profiles.py can't
+# tell "genuinely elite" from "tiny sample" — it just sees SR over the
+# Aggressive/Finisher cutoff and grants the same probability-mass boost
+# either way, every ball that player is in.
+BASE_RATE_SHRINK_K = 60.0
+
+# League-average priors the base rates shrink toward at low sample size —
+# same values already used as DEFAULT_BATTER/DEFAULT_BOWLER fallbacks in
+# match_simulator.py, so a zero-sample player and a heavily-shrunk
+# low-sample player converge to the same number instead of two different
+# "defaults" existing in the codebase.
+BASE_RATE_PRIOR = dict(
+    rw_sr=128.0, rw_economy=8.2, rw_avg=28.0,
+    rw_dot_pct=0.33, rw_boundary_pct=0.15, rw_six_pct=0.06, rw_wicket_pct=0.055,
+)
+
+
+def shrink_rate(raw: float, n: float, key: str, k: float = BASE_RATE_SHRINK_K) -> float:
+    """Empirical-Bayes shrinkage toward BASE_RATE_PRIOR[key], same K/(K+n)
+    weighting style as PLAYER_VENUE_SHRINK_K / BVB_*_SHRINK_K / OVERBAND_*
+    below. n=0 -> pure prior. n>>k -> raw dominates. Call this explicitly at
+    the specific point a base rate is about to be exported/consumed — NOT
+    inside _rw_agg() itself, since _rw_agg() is a shared low-level primitive
+    reused by the venue/band/BvB blends below, which already apply their own
+    purpose-built shrinkage on top of its raw output; shrinking inside
+    _rw_agg() too would double-shrink every one of those and over-flatten
+    real venue/matchup signal."""
+    prior = BASE_RATE_PRIOR[key]
+    if n <= 0:
+        return prior
+    weight = n / (n + k)
+    return raw * weight + prior * (1 - weight)
+
 # Shrinkage constant (in weighted balls) for player-at-venue blending.
 # With PLAYER_VENUE_SHRINK_K weighted balls of venue-specific history, the
 # blended stat sits exactly halfway between the venue-specific number and
@@ -49,12 +132,20 @@ HALF_LIFE_SEASONS = 3.0
 # venue-specific number.
 PLAYER_VENUE_SHRINK_K = 30.0
 
+# BvB shrinkage — split into two constants because dismissal is a much
+# rarer, noisier event than scoring rate. A batter facing a bowler 8 times
+# with 1 dismissal looks like a 12.5% dismissal rate off almost no evidence;
+# the same 8 balls give a genuinely more stable read on strike rate/dot%/
+# boundary%. So dismissal needs MORE weighted balls before the raw matchup
+# number is trusted over the bowler's own career wicket rate — hence a
+# larger K for dismissal than for everything else.
+BVB_OTHER_SHRINK_K     = 15.0   # sr / dot% / boundary% / six%
+BVB_DISMISSAL_SHRINK_K = 40.0   # dismissal% only
+
 # Over-band split for finer-grained situational stats than the 3-phase split
 # above — separates the early-middle overs (7-10) from the late-middle overs
 # (11-15), since batting approach genuinely differs between them even though
 # both fall under the single "middle" phase bucket.
-BVB_DISMISSAL_SHRINK_K = 25.0
-BVB_OTHER_SHRINK_K = 45.0
 OVER_BANDS = [
     ("1_6",   0,  5),
     ("7_10",  6,  9),
@@ -121,6 +212,22 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     print("Step G: batting context / pressure …")
     df = _add_batting_context(df)
 
+    # match_simulator.py handles wides/no-balls/byes/leg-byes as a SEPARATE
+    # pre-model layer (fixed empirical extras rates), specifically so the
+    # 7-class outcome model only needs to represent genuine legal deliveries.
+    # Illegal rows must stay present through every step above — Step E's
+    # over_runs/momentum tracking needs them (a wide's extra run still counts
+    # toward "runs in this over," matching what match_simulator.py tracks
+    # live) — but from here on they should never become a training example
+    # with their own outcome label. Filtering any earlier would silently
+    # undercount momentum features relative to live simulation; filtering
+    # here (after all state has propagated to subsequent legal balls, before
+    # column selection) is the correct point.
+    n_before = len(df)
+    df = df[df["is_legal"] == 1].reset_index(drop=True)
+    print(f"  Restricted to legal deliveries only: {n_before:,} -> {len(df):,} rows "
+          f"({n_before - len(df):,} wide/no-ball rows excluded from the training target)")
+
     print("Step H: final NaN safety net …")
     df = _fillna_engineered_columns(df)
 
@@ -144,19 +251,26 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
         # ── recency-weighted career stats — batter ────────────────────────────
         "bat_rw_avg", "bat_rw_sr", "bat_rw_boundary_pct", "bat_rw_six_pct",
         "bat_rw_dot_pct",
-        # phase-split batter (SR + boundary% + dot% for each phase)
-        "bat_pp_rw_sr", "bat_mid_rw_sr", "bat_death_rw_sr",
-        "bat_pp_rw_boundary_pct", "bat_mid_rw_boundary_pct", "bat_death_rw_boundary_pct",
-        "bat_pp_rw_dot_pct", "bat_mid_rw_dot_pct", "bat_death_rw_dot_pct",
+        # over-band batter (SR + boundary% + dot% for each of the 4 bands —
+        # replaces the old coarse powerplay/middle/death phase split)
+        "bat_1_6_rw_sr", "bat_7_10_rw_sr", "bat_11_15_rw_sr", "bat_16_20_rw_sr",
+        "bat_1_6_rw_boundary_pct", "bat_7_10_rw_boundary_pct",
+        "bat_11_15_rw_boundary_pct", "bat_16_20_rw_boundary_pct",
+        "bat_1_6_rw_dot_pct", "bat_7_10_rw_dot_pct",
+        "bat_11_15_rw_dot_pct", "bat_16_20_rw_dot_pct",
 
         # ── recency-weighted career stats — bowler ────────────────────────────
         "bowl_rw_economy", "bowl_rw_wicket_pct", "bowl_rw_dot_pct",
         "bowl_rw_boundary_pct",
-        # phase-split bowler (economy + wicket% + dot% + boundary% for each phase)
-        "bowl_pp_rw_economy", "bowl_mid_rw_economy", "bowl_death_rw_economy",
-        "bowl_pp_rw_wicket_pct", "bowl_mid_rw_wicket_pct", "bowl_death_rw_wicket_pct",
-        "bowl_pp_rw_dot_pct", "bowl_mid_rw_dot_pct", "bowl_death_rw_dot_pct",
-        "bowl_pp_rw_boundary_pct", "bowl_mid_rw_boundary_pct", "bowl_death_rw_boundary_pct",
+        # over-band bowler (economy + wicket% + dot% + boundary% per band)
+        "bowl_1_6_rw_economy", "bowl_7_10_rw_economy",
+        "bowl_11_15_rw_economy", "bowl_16_20_rw_economy",
+        "bowl_1_6_rw_wicket_pct", "bowl_7_10_rw_wicket_pct",
+        "bowl_11_15_rw_wicket_pct", "bowl_16_20_rw_wicket_pct",
+        "bowl_1_6_rw_dot_pct", "bowl_7_10_rw_dot_pct",
+        "bowl_11_15_rw_dot_pct", "bowl_16_20_rw_dot_pct",
+        "bowl_1_6_rw_boundary_pct", "bowl_7_10_rw_boundary_pct",
+        "bowl_11_15_rw_boundary_pct", "bowl_16_20_rw_boundary_pct",
 
         # ── player-at-venue interaction (NEW) ─────────────────────────────────
         "bat_venue_adj_sr", "bat_venue_adj_boundary_pct", "bat_venue_rw_balls",
@@ -182,9 +296,6 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
         "venue_rw_six_pct",
         "venue_rw_dot_pct",
         "venue_rw_wicket_pct",
-        "venue_rw_pp_sr", "venue_rw_mid_sr", "venue_rw_death_sr",
-        "venue_rw_pp_boundary_pct", "venue_rw_mid_boundary_pct", "venue_rw_death_boundary_pct",
-        "venue_rw_pp_wicket_pct", "venue_rw_mid_wicket_pct", "venue_rw_death_wicket_pct",
 
         # ── over-band stats (1-6 / 7-10 / 11-15 / 16-20), hierarchically shrunk ─
         "venue_rw_1_6_rr", "venue_rw_7_10_rr", "venue_rw_11_15_rr", "venue_rw_16_20_rr",
@@ -201,6 +312,7 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
 
         # ── batting context / pressure ────────────────────────────────────────
         "is_batting_first", "is_chasing", "target", "runs_needed", "rrr",
+        "modern_par_rr",
         "pressure_index", "required_runs_per_wicket", "balls_per_required_run",
         "pressure_weighted_rrr", "pressure_weighted_aggression",
 
@@ -261,7 +373,15 @@ def _add_match_state(df: pd.DataFrame) -> pd.DataFrame:
 # B. RECENCY-WEIGHTED PLAYER STATS  (+ shared causal-aggregation primitive)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _causal_season_stats(df: pd.DataFrame, group_cols, half_life: float = HALF_LIFE_SEASONS) -> pd.DataFrame:
+MODERN_ERA_MIN_SEASON = 2018  # T20 batting has changed enough that everything
+                               # except BvB (too sparse to afford excluding
+                               # any of it) is hard-restricted to this season
+                               # onward, not just exponentially discounted.
+
+
+def _causal_season_stats(df: pd.DataFrame, group_cols, half_life: float = HALF_LIFE_SEASONS,
+                          min_season: int = None, recent_window: int = 0,
+                          recent_boost: float = 1.0) -> pd.DataFrame:
     """
     THE CORE ANTI-LEAKAGE PRIMITIVE.
 
@@ -270,16 +390,29 @@ def _causal_season_stats(df: pd.DataFrame, group_cols, half_life: float = HALF_L
     a player's/matchup's/venue's stat for anything happening in season S can
     never depend on data from season S itself (let alone later seasons).
 
-    "Recency-weighted" here means every prior season contributes — including
-    the very first season in the dataset — but with exponentially decaying
-    weight the further back it is. Nothing is excluded by a hard age cutoff;
-    a 2018 match always contributes some (shrinking) amount to a player's
-    current numbers, exactly as intended.
+    min_season: if set, seasons before this are excluded ENTIRELY (hard
+    floor), not just exponentially discounted. Used for everything except
+    BvB — modern T20 batting is different enough from 2008-2017 that those
+    seasons shouldn't inform "current" career/venue numbers at all, whereas
+    BvB matchups are already sparse enough that excluding any history would
+    make most pairings data-free.
+
+    recent_window / recent_boost: opt-in, off by default (recent_window=0
+    is a no-op, so every existing caller behaves exactly as before). When
+    recent_window > 0, any prior season within that many seasons of the
+    target season gets its ordinary exponential weight multiplied by
+    recent_boost, on top of the half-life decay — i.e. a second, stronger
+    push specifically for "the last N seasons," rather than relying on the
+    half-life alone to make old data fade. Used for venue stats, where
+    conditions this year matter far more than a smooth multi-year decay
+    would otherwise give them.
 
     Merge the result back onto df using group_cols + ["season"] (NOT just
     group_cols) so each row only ever sees its own season's causal snapshot.
     """
     group_cols = list(group_cols)
+    if min_season is not None:
+        df = df[df["season"] >= min_season]
     per_season = df.groupby(group_cols + ["season"]).agg(
         runs=("runs_of_bat", "sum"),
         legal=("is_legal", "sum"),
@@ -293,7 +426,13 @@ def _causal_season_stats(df: pd.DataFrame, group_cols, half_life: float = HALF_L
     out_rows = []
 
     for keys, egrp in per_season.groupby(group_cols):
-        egrp = egrp.set_index("season").reindex(all_seasons, fill_value=0)
+        # egrp still carries group_cols as ordinary columns (groupby doesn't
+        # drop them from the sub-frame) — only the numeric agg columns below
+        # are ever read back out of egrp, but reindex(fill_value=0) would
+        # otherwise try to fill those leftover string columns with an int
+        # and crash (or, on lenient pandas, silently corrupt them). Drop
+        # them before reindexing since `keys` already carries the real values.
+        egrp = egrp.drop(columns=group_cols).set_index("season").reindex(all_seasons, fill_value=0)
         seasons_arr = egrp.index.values
 
         for target_season in all_seasons:
@@ -304,7 +443,10 @@ def _causal_season_stats(df: pd.DataFrame, group_cols, half_life: float = HALF_L
             if legal.sum() == 0:
                 continue
 
-            weights = 0.5 ** ((target_season - seasons_arr[prior_mask]) / half_life)
+            season_gap = target_season - seasons_arr[prior_mask]
+            weights = 0.5 ** (season_gap / half_life)
+            if recent_window > 0:
+                weights = np.where(season_gap <= recent_window, weights * recent_boost, weights)
             legal_w = (legal * weights).sum()
             if legal_w == 0:
                 continue
@@ -315,12 +457,17 @@ def _causal_season_stats(df: pd.DataFrame, group_cols, half_life: float = HALF_L
             sixes_w = (egrp["sixes"].values[prior_mask] * weights).sum()
 
             row = {"season": target_season}
-
-            if not isinstance(keys, tuple):
-                keys = (keys,)
-
-            for c, v in zip(group_cols, keys):
-                row[c] = v
+            if len(group_cols) == 1:
+                # groupby() on a LIST always yields tuple keys, even for a
+                # single-column list — `keys` here is ("A1",), not "A1".
+                # Assigning the raw tuple silently broke every downstream
+                # merge (df["striker"]=="A1" never equals ("A1",)), which is
+                # why every recency-weighted batter/bowler column came back
+                # 100% NaN and got flooded with the same fallback constant.
+                row[group_cols[0]] = keys[0] if isinstance(keys, tuple) else keys
+            else:
+                for c, v in zip(group_cols, keys):
+                    row[c] = v
             row.update(
                 rw_sr=runs_w / legal_w * 100,
                 rw_economy=runs_w / legal_w * 6,
@@ -391,7 +538,25 @@ def _add_recency_player_stats(df: pd.DataFrame) -> pd.DataFrame:
     """
 
     # ── career batter stats (causal by season) ────────────────────────────────
-    bat_df = _causal_season_stats(df, ["striker"]).rename(columns={
+    # MODERN_ERA_MIN_SEASON hard-floors this to 2018+ (see its docstring) —
+    # everything in B/C/F does, BvB (Step D) deliberately doesn't.
+    #
+    # shrink_rate()/BASE_RATE_PRIOR already exist in this file (see their
+    # docstrings above) and are explicitly meant to be called right here —
+    # but Step B was never actually calling them. That's the bug: every
+    # OTHER derived stat (venue, band, BvB) shrinks toward a prior by
+    # sample size; these raw career numbers didn't, so a player with a
+    # handful of weighted balls (e.g. a bowler's rare batting innings) fed
+    # the model a raw, noise-driven SR/avg at full confidence — same
+    # unshrunk-small-sample problem as everywhere else in this pipeline,
+    # just never patched at this specific spot.
+    bat_df = _causal_season_stats(df, ["striker"], min_season=MODERN_ERA_MIN_SEASON)
+    bat_df["rw_avg"]          = bat_df.apply(lambda r: shrink_rate(r["rw_avg"], r["rw_balls"], "rw_avg"), axis=1)
+    bat_df["rw_sr"]           = bat_df.apply(lambda r: shrink_rate(r["rw_sr"], r["rw_balls"], "rw_sr"), axis=1)
+    bat_df["rw_dot_pct"]      = bat_df.apply(lambda r: shrink_rate(r["rw_dot_pct"], r["rw_balls"], "rw_dot_pct"), axis=1)
+    bat_df["rw_boundary_pct"] = bat_df.apply(lambda r: shrink_rate(r["rw_boundary_pct"], r["rw_balls"], "rw_boundary_pct"), axis=1)
+    bat_df["rw_six_pct"]      = bat_df.apply(lambda r: shrink_rate(r["rw_six_pct"], r["rw_balls"], "rw_six_pct"), axis=1)
+    bat_df = bat_df.rename(columns={
         "rw_avg":          "bat_rw_avg",
         "rw_sr":           "bat_rw_sr",
         "rw_dot_pct":      "bat_rw_dot_pct",
@@ -401,21 +566,35 @@ def _add_recency_player_stats(df: pd.DataFrame) -> pd.DataFrame:
         "bat_rw_boundary_pct", "bat_rw_six_pct"]]
     df = df.merge(bat_df, on=["striker", "season"], how="left")
 
-    # ── phase-split batter stats (causal by season, computed on phase subset) ─
-    for phase_name, phase_tag in [("powerplay", "pp"), ("middle", "mid"), ("death", "death")]:
-        sub = df[df["phase"] == phase_name]
-        phase_df = _causal_season_stats(sub, ["striker"])
-        if len(phase_df):
-            phase_df = phase_df.rename(columns={
-                "rw_sr":           f"bat_{phase_tag}_rw_sr",
-                "rw_boundary_pct": f"bat_{phase_tag}_rw_boundary_pct",
-                "rw_dot_pct":      f"bat_{phase_tag}_rw_dot_pct",
-            })[["striker", "season", f"bat_{phase_tag}_rw_sr",
-                f"bat_{phase_tag}_rw_boundary_pct", f"bat_{phase_tag}_rw_dot_pct"]]
-            df = df.merge(phase_df, on=["striker", "season"], how="left")
+    # ── over-band batter stats (causal by season, computed per OVER_BANDS) ────
+    # Replaces the old 3-bucket powerplay/middle/death split — "middle" was
+    # too coarse (overs 7-10 and 11-15 play very differently) and there is no
+    # such thing as a real discrete "phase" boundary in how batters actually
+    # approach an innings. Every batter/bowler gets one number per band.
+    for band_tag, lo, hi in OVER_BANDS:
+        band_df = _band_stats(df, ["striker"], lo, hi, min_season=MODERN_ERA_MIN_SEASON)
+        if len(band_df):
+            # Over-bands have SMALLER samples than full-career stats by
+            # construction (1/4 of the overs), so this shrinkage matters even
+            # more here than for the plain career numbers above.
+            band_df["rw_sr"]           = band_df.apply(lambda r: shrink_rate(r["rw_sr"], r["rw_balls"], "rw_sr"), axis=1)
+            band_df["rw_boundary_pct"] = band_df.apply(lambda r: shrink_rate(r["rw_boundary_pct"], r["rw_balls"], "rw_boundary_pct"), axis=1)
+            band_df["rw_dot_pct"]      = band_df.apply(lambda r: shrink_rate(r["rw_dot_pct"], r["rw_balls"], "rw_dot_pct"), axis=1)
+            band_df = band_df.rename(columns={
+                "rw_sr":           f"bat_{band_tag}_rw_sr",
+                "rw_boundary_pct": f"bat_{band_tag}_rw_boundary_pct",
+                "rw_dot_pct":      f"bat_{band_tag}_rw_dot_pct",
+            })[["striker", "season", f"bat_{band_tag}_rw_sr",
+                f"bat_{band_tag}_rw_boundary_pct", f"bat_{band_tag}_rw_dot_pct"]]
+            df = df.merge(band_df, on=["striker", "season"], how="left")
 
     # ── career bowler stats (causal by season) ────────────────────────────────
-    bowl_df = _causal_season_stats(df, ["bowler"]).rename(columns={
+    bowl_df = _causal_season_stats(df, ["bowler"], min_season=MODERN_ERA_MIN_SEASON)
+    bowl_df["rw_economy"]      = bowl_df.apply(lambda r: shrink_rate(r["rw_economy"], r["rw_balls"], "rw_economy"), axis=1)
+    bowl_df["rw_wicket_pct"]   = bowl_df.apply(lambda r: shrink_rate(r["rw_wicket_pct"], r["rw_balls"], "rw_wicket_pct"), axis=1)
+    bowl_df["rw_dot_pct"]      = bowl_df.apply(lambda r: shrink_rate(r["rw_dot_pct"], r["rw_balls"], "rw_dot_pct"), axis=1)
+    bowl_df["rw_boundary_pct"] = bowl_df.apply(lambda r: shrink_rate(r["rw_boundary_pct"], r["rw_balls"], "rw_boundary_pct"), axis=1)
+    bowl_df = bowl_df.rename(columns={
         "rw_economy":      "bowl_rw_economy",
         "rw_wicket_pct":   "bowl_rw_wicket_pct",
         "rw_dot_pct":      "bowl_rw_dot_pct",
@@ -424,19 +603,22 @@ def _add_recency_player_stats(df: pd.DataFrame) -> pd.DataFrame:
         "bowl_rw_dot_pct", "bowl_rw_boundary_pct"]]
     df = df.merge(bowl_df, on=["bowler", "season"], how="left")
 
-    # ── phase-split bowler stats (causal by season) ───────────────────────────
-    for phase_name, phase_tag in [("powerplay", "pp"), ("middle", "mid"), ("death", "death")]:
-        sub = df[df["phase"] == phase_name]
-        phase_df = _causal_season_stats(sub, ["bowler"])
-        if len(phase_df):
-            phase_df = phase_df.rename(columns={
-                "rw_economy":      f"bowl_{phase_tag}_rw_economy",
-                "rw_wicket_pct":   f"bowl_{phase_tag}_rw_wicket_pct",
-                "rw_dot_pct":      f"bowl_{phase_tag}_rw_dot_pct",
-                "rw_boundary_pct": f"bowl_{phase_tag}_rw_boundary_pct",
-            })[["bowler", "season", f"bowl_{phase_tag}_rw_economy", f"bowl_{phase_tag}_rw_wicket_pct",
-                f"bowl_{phase_tag}_rw_dot_pct", f"bowl_{phase_tag}_rw_boundary_pct"]]
-            df = df.merge(phase_df, on=["bowler", "season"], how="left")
+    # ── over-band bowler stats (causal by season, computed per OVER_BANDS) ────
+    for band_tag, lo, hi in OVER_BANDS:
+        band_df = _band_stats(df, ["bowler"], lo, hi, min_season=MODERN_ERA_MIN_SEASON)
+        if len(band_df):
+            band_df["rw_economy"]      = band_df.apply(lambda r: shrink_rate(r["rw_economy"], r["rw_balls"], "rw_economy"), axis=1)
+            band_df["rw_wicket_pct"]   = band_df.apply(lambda r: shrink_rate(r["rw_wicket_pct"], r["rw_balls"], "rw_wicket_pct"), axis=1)
+            band_df["rw_dot_pct"]      = band_df.apply(lambda r: shrink_rate(r["rw_dot_pct"], r["rw_balls"], "rw_dot_pct"), axis=1)
+            band_df["rw_boundary_pct"] = band_df.apply(lambda r: shrink_rate(r["rw_boundary_pct"], r["rw_balls"], "rw_boundary_pct"), axis=1)
+            band_df = band_df.rename(columns={
+                "rw_economy":      f"bowl_{band_tag}_rw_economy",
+                "rw_wicket_pct":   f"bowl_{band_tag}_rw_wicket_pct",
+                "rw_dot_pct":      f"bowl_{band_tag}_rw_dot_pct",
+                "rw_boundary_pct": f"bowl_{band_tag}_rw_boundary_pct",
+            })[["bowler", "season", f"bowl_{band_tag}_rw_economy", f"bowl_{band_tag}_rw_wicket_pct",
+                f"bowl_{band_tag}_rw_dot_pct", f"bowl_{band_tag}_rw_boundary_pct"]]
+            df = df.merge(band_df, on=["bowler", "season"], how="left")
 
     # Rookies / first-ever-appearance rows have no PRIOR season yet, so the
     # merges above leave NaN — the blanket safety net in Step H catches
@@ -466,7 +648,7 @@ def _add_player_venue_features(df: pd.DataFrame) -> pd.DataFrame:
     K = PLAYER_VENUE_SHRINK_K
 
     # ── batter at venue ────────────────────────────────────────────────────
-    bv_df = _causal_season_stats(df, ["striker", "venue"]).rename(columns={
+    bv_df = _causal_season_stats(df, ["striker", "venue"], min_season=MODERN_ERA_MIN_SEASON).rename(columns={
         "rw_sr":           "bat_venue_rw_sr",
         "rw_boundary_pct": "bat_venue_rw_boundary_pct",
         "rw_balls":        "bat_venue_rw_balls",
@@ -485,7 +667,7 @@ def _add_player_venue_features(df: pd.DataFrame) -> pd.DataFrame:
     )
 
     # ── bowler at venue ────────────────────────────────────────────────────
-    bwv_df = _causal_season_stats(df, ["bowler", "venue"]).rename(columns={
+    bwv_df = _causal_season_stats(df, ["bowler", "venue"], min_season=MODERN_ERA_MIN_SEASON).rename(columns={
         "rw_economy":    "bowl_venue_rw_economy",
         "rw_wicket_pct": "bowl_venue_rw_wicket_pct",
         "rw_balls":      "bowl_venue_rw_balls",
@@ -511,10 +693,13 @@ def _add_player_venue_features(df: pd.DataFrame) -> pd.DataFrame:
 #     overs 1-6, 7-10, 11-15, 16-20, with hierarchical shrinkage)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _band_stats(df: pd.DataFrame, group_cols, lo: int, hi: int) -> pd.DataFrame:
+def _band_stats(df: pd.DataFrame, group_cols, lo: int, hi: int,
+                 min_season: int = None, half_life: float = HALF_LIFE_SEASONS,
+                 recent_window: int = 0, recent_boost: float = 1.0) -> pd.DataFrame:
     """_causal_season_stats restricted to a single over-band."""
     sub = df[(df["over_num"] >= lo) & (df["over_num"] <= hi)]
-    return _causal_season_stats(sub, group_cols)
+    return _causal_season_stats(sub, group_cols, half_life=half_life, min_season=min_season,
+                                 recent_window=recent_window, recent_boost=recent_boost)
 
 
 def _add_overband_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -540,24 +725,54 @@ def _add_overband_features(df: pd.DataFrame) -> pd.DataFrame:
     number when there's real band-specific data to justify it.
     """
 
-    # ── venue over-bands (single-entity, no shrinkage needed — same pattern
-    #    as the phase-split venue stats, just finer bins) ─────────────────────
+    # ── venue over-bands, shrunk toward the global rate prior + boosted for
+    #    the last RECENT_VENUE_SEASON_WINDOW seasons ────────────────────────
+    # Previously left completely unshrunk on the (mistaken) assumption that a
+    # single-entity bucket like "venue" doesn't need it the way a per-player
+    # bucket does — backwards for exactly the venues that need this most: a
+    # new or rarely-used ground's over-band numbers were riding on whatever
+    # handful of matches happened to exist, with nothing to pull them toward
+    # a sane league rate. OVERBAND_SHRINK_K_COARSE was already defined for
+    # this (a coarser shrink than the per-player OVERBAND_SHRINK_K, since a
+    # venue-band bucket pools many players' balls) but was never applied.
     for band_tag, lo, hi in OVER_BANDS:
-        band_df = _band_stats(df, ["venue"], lo, hi)
+        band_df = _band_stats(df, ["venue"], lo, hi, min_season=MODERN_ERA_MIN_SEASON,
+                               half_life=VENUE_HALF_LIFE_SEASONS,
+                               recent_window=RECENT_VENUE_SEASON_WINDOW,
+                               recent_boost=RECENT_VENUE_SEASON_BOOST)
         if len(band_df):
             band_df = band_df.assign(**{
-                f"venue_rw_{band_tag}_rr":         band_df["rw_sr"] * 0.06,  # SR (runs/100 balls) -> runs/over
-                f"venue_rw_{band_tag}_wicket_pct":  band_df["rw_wicket_pct"],
-            })[["venue", "season", f"venue_rw_{band_tag}_rr", f"venue_rw_{band_tag}_wicket_pct"]]
+                f"_venue_band_rr_{band_tag}":         band_df["rw_sr"] * 0.06,  # SR -> runs/over
+                f"_venue_band_wicket_pct_{band_tag}":  band_df["rw_wicket_pct"],
+                f"_venue_band_balls_{band_tag}":       band_df["rw_balls"],
+            })[["venue", "season", f"_venue_band_rr_{band_tag}",
+                f"_venue_band_wicket_pct_{band_tag}", f"_venue_band_balls_{band_tag}"]]
             df = df.merge(band_df, on=["venue", "season"], how="left")
         else:
-            df[f"venue_rw_{band_tag}_rr"] = np.nan
-            df[f"venue_rw_{band_tag}_wicket_pct"] = np.nan
+            df[f"_venue_band_rr_{band_tag}"] = np.nan
+            df[f"_venue_band_wicket_pct_{band_tag}"] = np.nan
+            df[f"_venue_band_balls_{band_tag}"] = 0.0
+
+        balls = df[f"_venue_band_balls_{band_tag}"].fillna(0.0)
+        shrink = balls / (balls + OVERBAND_SHRINK_K_COARSE)
+        # Global rate prior, same one every player-level rate already shrinks
+        # toward — a venue-band bucket is still fundamentally "how often does
+        # X happen on a random ball," just narrowed to one venue + one band.
+        par_rr = BASE_RATE_PRIOR["rw_sr"] * 0.06
+        df[f"venue_rw_{band_tag}_rr"] = (
+            shrink * df[f"_venue_band_rr_{band_tag}"].fillna(par_rr) + (1 - shrink) * par_rr
+        )
+        df[f"venue_rw_{band_tag}_wicket_pct"] = (
+            shrink * df[f"_venue_band_wicket_pct_{band_tag}"].fillna(BASE_RATE_PRIOR["rw_wicket_pct"])
+            + (1 - shrink) * BASE_RATE_PRIOR["rw_wicket_pct"]
+        )
+        df.drop(columns=[f"_venue_band_rr_{band_tag}", f"_venue_band_wicket_pct_{band_tag}",
+                          f"_venue_band_balls_{band_tag}"], inplace=True)
 
     # ── batter-at-venue over-bands, shrunk toward the already-shrunk
     #    venue-adjusted career number (bat_venue_adj_sr) ───────────────────────
     for band_tag, lo, hi in OVER_BANDS:
-        band_df = _band_stats(df, ["striker", "venue"], lo, hi)
+        band_df = _band_stats(df, ["striker", "venue"], lo, hi, min_season=MODERN_ERA_MIN_SEASON)
         if len(band_df):
             band_df = band_df.rename(columns={
                 "rw_sr": f"_band_sr_{band_tag}", "rw_avg": f"_band_avg_{band_tag}",
@@ -584,7 +799,7 @@ def _add_overband_features(df: pd.DataFrame) -> pd.DataFrame:
 
     # ── bowler-at-venue over-bands, shrunk toward bowl_venue_adj_economy ──────
     for band_tag, lo, hi in OVER_BANDS:
-        band_df = _band_stats(df, ["bowler", "venue"], lo, hi)
+        band_df = _band_stats(df, ["bowler", "venue"], lo, hi, min_season=MODERN_ERA_MIN_SEASON)
         if len(band_df):
             band_df = band_df.rename(columns={
                 "rw_economy": f"_band_econ_{band_tag}", "rw_wicket_pct": f"_band_wkt_{band_tag}",
@@ -663,11 +878,25 @@ def _add_bvb_features(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = np.nan
 
     df["bvb_balls"] = df["bvb_balls"].fillna(0.0)
-    df["bvb_rw_sr"]            = df["bvb_rw_sr"].fillna(df["bat_rw_sr"])
-    df["bvb_rw_dismissal_pct"] = df["bvb_rw_dismissal_pct"].fillna(df["bowl_rw_wicket_pct"])
-    df["bvb_rw_dot_pct"]       = df["bvb_rw_dot_pct"].fillna(df["bat_rw_dot_pct"])
-    df["bvb_rw_boundary_pct"]  = df["bvb_rw_boundary_pct"].fillna(df["bat_rw_boundary_pct"])
-    df["bvb_rw_six_pct"]       = df["bvb_rw_six_pct"].fillna(df["bat_rw_six_pct"])
+
+    # Previously a hard cutover: fall back to career stats ONLY when there
+    # was literally zero matchup history, otherwise trust the raw BvB number
+    # completely regardless of sample size. That let a batter facing a
+    # bowler once or twice — a coin-flip outcome — get treated as fully real
+    # matchup signal. BVB_OTHER_SHRINK_K / BVB_DISMISSAL_SHRINK_K were
+    # already defined for exactly this (a smooth balls/(balls+K) blend, same
+    # pattern as every other shrinkage in this file) but were never applied.
+    _shrink_other   = df["bvb_balls"] / (df["bvb_balls"] + BVB_OTHER_SHRINK_K)
+    _shrink_dismiss = df["bvb_balls"] / (df["bvb_balls"] + BVB_DISMISSAL_SHRINK_K)
+
+    def _blend(raw_col, fallback_col, shrink):
+        return shrink * raw_col.fillna(fallback_col) + (1 - shrink) * fallback_col
+
+    df["bvb_rw_sr"]            = _blend(df["bvb_rw_sr"],            df["bat_rw_sr"],          _shrink_other)
+    df["bvb_rw_dismissal_pct"] = _blend(df["bvb_rw_dismissal_pct"], df["bowl_rw_wicket_pct"],  _shrink_dismiss)
+    df["bvb_rw_dot_pct"]       = _blend(df["bvb_rw_dot_pct"],       df["bat_rw_dot_pct"],      _shrink_other)
+    df["bvb_rw_boundary_pct"]  = _blend(df["bvb_rw_boundary_pct"],  df["bat_rw_boundary_pct"], _shrink_other)
+    df["bvb_rw_six_pct"]       = _blend(df["bvb_rw_six_pct"],       df["bat_rw_six_pct"],      _shrink_other)
 
     return df
 
@@ -846,17 +1075,61 @@ def _add_venue_features(df: pd.DataFrame) -> pd.DataFrame:
             prior = by_season[by_season.index < target_season]
             if prior["inn1_n"].sum() == 0:
                 continue
-            w = 0.5 ** ((target_season - prior.index.values) / HALF_LIFE_SEASONS)
+            season_gap = target_season - prior.index.values
+            w = 0.5 ** (season_gap / HALF_LIFE_SEASONS)
+            # Same last-2-seasons boost as venue_ball_df below — a venue's
+            # scoring level (pitch, boundary size, dew) can shift meaningfully
+            # season to season, so recent matches should dominate the average
+            # far more than the ordinary half-life decay alone gives them.
+            w = np.where(season_gap <= RECENT_VENUE_SEASON_WINDOW, w * RECENT_VENUE_SEASON_BOOST, w)
             inn1_n_w = (prior["inn1_n"].values * w).sum()
             inn2_n_w = (prior["inn2_n"].values * w).sum()
+
+            raw_inn1 = (prior["inn1_sum"].values * w).sum() / inn1_n_w if inn1_n_w > 0 else np.nan
+            raw_inn2 = (prior["inn2_sum"].values * w).sum() / inn2_n_w if inn2_n_w > 0 else np.nan
+
+            # Shrink toward the league par score — inn1_n_w/inn2_n_w are
+            # recency-(and now recent-season-)weighted MATCH counts, so
+            # VENUE_INNINGS_SHRINK_K is in matches, not balls. Previously
+            # unshrunk entirely, which is exactly what let a venue with a
+            # handful of matches (new grounds, or old grounds visited only
+            # sporadically) show only 3-6 distinct values across its whole
+            # history instead of a real, evolving read.
+            shrink1 = inn1_n_w / (inn1_n_w + VENUE_INNINGS_SHRINK_K) if inn1_n_w > 0 else 0.0
+            shrink2 = inn2_n_w / (inn2_n_w + VENUE_INNINGS_SHRINK_K) if inn2_n_w > 0 else 0.0
+            venue_avg_1st = (
+                shrink1 * raw_inn1 + (1 - shrink1) * VENUE_INNINGS_AVG_PRIOR["inn1"]
+                if inn1_n_w > 0 else np.nan
+            )
+            venue_avg_2nd = (
+                shrink2 * raw_inn2 + (1 - shrink2) * VENUE_INNINGS_AVG_PRIOR["inn2"]
+                if inn2_n_w > 0 else np.nan
+            )
             score_rows.append({
                 "venue": venue, "season": target_season,
-                "venue_rw_avg_1st_innings": (prior["inn1_sum"].values * w).sum() / inn1_n_w if inn1_n_w > 0 else np.nan,
-                "venue_rw_avg_2nd_innings": (prior["inn2_sum"].values * w).sum() / inn2_n_w if inn2_n_w > 0 else np.nan,
+                "venue_rw_avg_1st_innings": venue_avg_1st,
+                "venue_rw_avg_2nd_innings": venue_avg_2nd,
             })
     venue_score_df = pd.DataFrame(score_rows)
 
-    venue_ball_df = _causal_season_stats(df, ["venue"]).rename(columns={
+    venue_ball_raw = _causal_season_stats(df, ["venue"], half_life=VENUE_HALF_LIFE_SEASONS,
+                                           min_season=MODERN_ERA_MIN_SEASON,
+                                           recent_window=RECENT_VENUE_SEASON_WINDOW,
+                                           recent_boost=RECENT_VENUE_SEASON_BOOST)
+    if len(venue_ball_raw):
+        # Previously these four went straight from raw recency-weighted rate
+        # to feature column with no shrinkage at all — unlike every
+        # analogous player-level rate (bat_rw_*, bowl_rw_*), which all shrink
+        # toward BASE_RATE_PRIOR via this exact function. A thin/new venue's
+        # boundary%/six%/dot%/wicket% were riding entirely on whatever small
+        # (and, with the recency boost above, now even smaller-effective-
+        # sample) history existed, with nothing to pull them toward a sane
+        # league rate.
+        for key in ["rw_boundary_pct", "rw_six_pct", "rw_dot_pct", "rw_wicket_pct"]:
+            venue_ball_raw[key] = venue_ball_raw.apply(
+                lambda r, k=key: shrink_rate(r[k], r["rw_balls"], k), axis=1
+            )
+    venue_ball_df = venue_ball_raw.rename(columns={
         "rw_boundary_pct": "venue_rw_boundary_pct",
         "rw_six_pct":      "venue_rw_six_pct",
         "rw_dot_pct":      "venue_rw_dot_pct",
@@ -864,21 +1137,13 @@ def _add_venue_features(df: pd.DataFrame) -> pd.DataFrame:
     })[["venue", "season", "venue_rw_boundary_pct", "venue_rw_six_pct",
         "venue_rw_dot_pct", "venue_rw_wicket_pct"]]
 
-    # Full phase-split venue character (previously only had pp/death SR —
-    # missing the middle overs entirely, and missing boundary/wicket rate
-    # per phase, which matters a lot for telling a "flat, boundary-friendly
-    # ground" apart from a "hard to score on but wicket-prone" one in the
-    # same phase).
-    for phase_name, phase_tag in [("powerplay", "pp"), ("middle", "mid"), ("death", "death")]:
-        phase_df = _causal_season_stats(df[df["phase"] == phase_name], ["venue"])
-        if len(phase_df):
-            phase_df = phase_df.rename(columns={
-                "rw_sr":           f"venue_rw_{phase_tag}_sr",
-                "rw_boundary_pct": f"venue_rw_{phase_tag}_boundary_pct",
-                "rw_wicket_pct":   f"venue_rw_{phase_tag}_wicket_pct",
-            })[["venue", "season", f"venue_rw_{phase_tag}_sr",
-                f"venue_rw_{phase_tag}_boundary_pct", f"venue_rw_{phase_tag}_wicket_pct"]]
-            venue_ball_df = venue_ball_df.merge(phase_df, on=["venue", "season"], how="left")
+    # Phase-split venue character (pp/mid/death) has been REMOVED — it's now
+    # fully superseded by the finer 4-band venue stats in
+    # _add_overband_features() (venue_rw_1_6_rr, venue_rw_7_10_rr,
+    # venue_rw_11_15_rr, venue_rw_16_20_rr + per-band wicket_pct), which use
+    # the same VENUE_HALF_LIFE_SEASONS recency weighting. Keeping both was
+    # redundant and the 3-bucket version used the coarser, less recency-
+    # weighted split this whole restructure was meant to get rid of.
 
     venue_df = venue_score_df.merge(venue_ball_df, on=["venue", "season"], how="outer")
     df = df.merge(venue_df, on=["venue", "season"], how="left")
@@ -888,6 +1153,35 @@ def _add_venue_features(df: pd.DataFrame) -> pd.DataFrame:
 # ═══════════════════════════════════════════════════════════════════════════════
 # G. BATTING CONTEXT / PRESSURE
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def _modern_par_run_rate_by_season(df: pd.DataFrame, half_life: float) -> dict:
+    """
+    Causal, recency-weighted 'par' run rate (runs/over), computed per season
+    from completed 1st-innings totals only, using STRICTLY PRIOR seasons —
+    same anti-leakage discipline as _causal_season_stats. Used to normalize
+    pressure_index so a required rate is judged against what's actually
+    gettable in that season's scoring environment, not a fixed magnitude.
+    """
+    inn1 = df[df["innings"] == 1].groupby("match_id").agg(
+        final_score=("cumulative_runs", "max"),
+        season=("season", "first"),
+    ).reset_index()
+    inn1["run_rate"] = inn1["final_score"] / 20.0
+
+    per_season_rr = inn1.groupby("season")["run_rate"].mean()
+    all_seasons = np.sort(df["season"].unique())
+    overall_mean = float(per_season_rr.mean()) if len(per_season_rr) else 8.0
+
+    par = {}
+    for target_season in all_seasons:
+        prior = per_season_rr[per_season_rr.index < target_season]
+        if len(prior) == 0:
+            par[target_season] = overall_mean
+            continue
+        weights = 0.5 ** ((target_season - prior.index.values) / half_life)
+        par[target_season] = float((prior.values * weights).sum() / weights.sum())
+    return par
+
 
 def _add_batting_context(df: pd.DataFrame) -> pd.DataFrame:
     df["is_batting_first"] = (df["innings"] == 1).astype(int)
@@ -914,9 +1208,20 @@ def _add_batting_context(df: pd.DataFrame) -> pd.DataFrame:
         0.0,
     )
 
+    # ── Recency-weighted "modern par" run rate ─────────────────────────────
+    # A required rate of 15/over (e.g. 75 off 30 balls) was a near-impossible
+    # ask in 2010-era T20 cricket but is a completely gettable target in the
+    # modern game. Using the raw (rrr - crr) difference treats both eras as
+    # equally "pressured" for the same numeric gap, which is wrong. Instead,
+    # normalize against a CAUSAL, heavily recency-weighted par run rate
+    # (completed 1st-innings totals only, same short half-life as venue
+    # stats) so pressure scales with what's actually achievable *right now*.
+    par_rr_by_season = _modern_par_run_rate_by_season(df, half_life=VENUE_HALF_LIFE_SEASONS)
+    df["modern_par_rr"] = df["season"].map(par_rr_by_season).fillna(8.0)
+
     df["pressure_index"] = np.where(
         df["innings"] == 2,
-        df["rrr"] - df["crr"],
+        (df["rrr"] - df["crr"]) / df["modern_par_rr"],
         0.0,
     )
 
