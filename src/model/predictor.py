@@ -21,6 +21,20 @@ from typing import Dict, List
 
 from .calibration import load_calibrator, OutcomeCalibrator
 
+# Must match colab_training.py's CATEGORICAL list EXACTLY. Training casts
+# these columns to pandas `category` dtype and fits with
+# enable_categorical=True, so XGBoost learns NATIVE categorical splits
+# (set-membership, e.g. "venue in {3,7,12}") for these columns — not
+# ordinary numeric-threshold splits. If inference hands the booster a plain
+# integer/float DMatrix for these columns instead, those categorical splits
+# get evaluated as if they were numeric thresholds, silently misrouting
+# rows through the wrong branches. This doesn't error — it just quietly
+# produces wrong probabilities, and it's most visible on exactly the
+# features that matter most (which striker/bowler/venue/phase), which is
+# why it especially distorts wicket probability. See _CATEGORICAL_COLS
+# usage in predict_proba() below.
+_CATEGORICAL_COLS = ["striker", "bowler", "batting_team", "bowling_team", "venue", "phase"]
+
 # Resolve relative to THIS file, not the process's current working directory.
 # predictor.py lives at src/model/predictor.py, so parent.parent.parent is the
 # project root. A bare Path("models") looked fine in testing but silently
@@ -75,7 +89,7 @@ class BallOutcomePredictor:
             # Legacy path — only works if local xgboost matches the version
             # the model was trained with. Re-export from Colab as JSON
             # (booster.save_model("ipl_ball_model.json")) to avoid this.
-            print("⚠  models/ipl_ball_model.json not found — falling back to "
+            print("[WARN] models/ipl_ball_model.json not found - falling back to "
                   "the pickled model. This WILL break if your local xgboost "
                   "version differs from the one used to train it. Re-export "
                   "from Colab with booster.save_model('ipl_ball_model.json').")
@@ -83,14 +97,28 @@ class BallOutcomePredictor:
             self.booster = None
 
         self.calibrator: OutcomeCalibrator = load_calibrator(models_dir)
-        print("Model loaded ✓")
+        print("Model loaded [OK]")
 
     def predict_proba(self, ball_context: dict) -> Dict[str, float]:
         row = self._encode_row(ball_context)
         X   = pd.DataFrame([row]).reindex(columns=self.feature_cols, fill_value=0)
 
+        # ── Restore categorical dtype for the columns trained as native
+        # XGBoost categoricals — see _CATEGORICAL_COLS above. Without this,
+        # every prediction silently mis-evaluates the categorical splits on
+        # striker/bowler/venue/phase, which is what was producing the
+        # erratic, statistically-impossible ball outcomes (e.g. P(1)
+        # crashing to ~2% and P(W) spiking to ~19% between two consecutive
+        # balls with the exact same batter/bowler).
+        for col in _CATEGORICAL_COLS:
+            if col in X.columns:
+                X[col] = X[col].astype("category")
+
         if self.booster is not None:
-            dmat  = xgb.DMatrix(X, feature_names=self.feature_cols)
+            # enable_categorical=True is required here to match training —
+            # without it, xgboost either raises or (worse) silently treats
+            # these columns as plain numeric, which is the bug this fixes.
+            dmat  = xgb.DMatrix(X, feature_names=self.feature_cols, enable_categorical=True)
             probs = self.booster.predict(dmat)[0]
         else:
             probs = self.model.predict_proba(X)[0]

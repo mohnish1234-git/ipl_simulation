@@ -148,7 +148,7 @@ class PhaseCalibrator:
         for phase in PHASES:
             mask = phase_labels == phase
             if mask.sum() == 0:
-                print(f"⚠  No validation rows for phase='{phase}' — skipping "
+                print(f"[WARN] No validation rows for phase='{phase}' - skipping "
                       f"(that phase will fall back to raw, uncalibrated probabilities).")
                 continue
             cal = OutcomeCalibrator()
@@ -200,13 +200,13 @@ def load_calibrator(models_dir: Path) -> Optional[Union[OutcomeCalibrator, Phase
     """
     path = Path(models_dir) / "outcome_calibrator.pkl"
     if not path.exists():
-        print("⚠  No calibrator found in models/ — using raw model probabilities")
+        print("[WARN] No calibrator found in models/ - using raw model probabilities")
         return None
 
     try:
         raw = joblib.load(path)
     except Exception as e:
-        print(f"⚠  Failed to load calibrator ({e}) — using raw model probabilities")
+        print(f"[WARN] Failed to load calibrator ({e}) - using raw model probabilities")
         return None
 
     top_keys = set(raw.keys())
@@ -219,16 +219,16 @@ def load_calibrator(models_dir: Path) -> Optional[Union[OutcomeCalibrator, Phase
             oc.fitted = True
             cal.by_phase[phase] = oc
         cal.fitted = True
-        print(f"Calibrator loaded ✓ (phase-conditional: {sorted(cal.by_phase.keys())})")
+        print(f"Calibrator loaded [OK] (phase-conditional: {sorted(cal.by_phase.keys())})")
         return cal
 
     if top_keys.issubset(set(OUTCOMES)):
         cal = OutcomeCalibrator()
         cal.calibrators = raw
         cal.fitted = True
-        print("Calibrator loaded ✓ (flat, single global calibrator)")
+        print("Calibrator loaded [OK] (flat, single global calibrator)")
         return cal
 
-    print(f"⚠  Unrecognized calibrator file format (top-level keys={top_keys}) "
-          f"— using raw model probabilities")
+    print(f"[WARN] Unrecognized calibrator file format (top-level keys={top_keys}) "
+          f"- using raw model probabilities")
     return None

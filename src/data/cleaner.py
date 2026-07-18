@@ -7,16 +7,15 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 
-from .venue_mapping import filter_to_allowed_venues, print_unmapped_venues
+from .team_mapping import canonicalize_team, print_unmapped_teams
 
 RAW_PATH = Path("data/raw/ipl_final.csv")
 PROCESSED_DIR = Path("data/processed")
 
 # Set True once, run prepare_data.py, read the printout, then set back to
-# False. Lets you see every raw venue string that didn't match one of the
-# 13 allowed grounds before you silently start dropping that data.
+# False. Lets you see every raw team string that didn't match a known
+# alias before you silently misgroup that data.
 DIAGNOSE_UNMAPPED_VENUES = False
-
 
 def load_raw(path: Path = RAW_PATH) -> pd.DataFrame:
     df = pd.read_csv(path)
@@ -51,11 +50,31 @@ def clean(df: pd.DataFrame) -> pd.DataFrame:
     df["total_runs"] = df["runs_of_bat"] + df["extras"]
 
     # ── Outcome label ────────────────────────────────────────────────────────
-    # Values: 0, 1, 2, 3, 4, 6, W
+    # Standard 7-class outcome space used throughout this whole pipeline:
+    # {0,1,2,3,4,6,W}. predictor.py, calibration.py, and Colab's num_class
+    # all hardcode exactly these 7 classes.
+    #
+    # A wicket ALWAYS labels the ball "W", regardless of runs completed
+    # before the dismissal. The previous version only did this when
+    # runs_of_bat == 0, so a run-out after the batters had already crossed
+    # for 1+ runs got labeled with the run count instead of "W" — silently
+    # dropping that wicket from the classification target entirely. This
+    # matters: run-outs are a real, non-trivial share of dismissals, and
+    # they were being taught to the model as "just a run", not a wicket.
+    #
+    # Any run value outside {0,1,2,3,4,6} (a rare "5", or an even rarer 7+
+    # from extreme overthrows) is folded into the nearest standard class —
+    # simpler than expanding every downstream file to handle an 8th class
+    # for what is a genuine but very rare scoring edge case.
+    _STANDARD_RUNS = (0, 1, 2, 3, 4, 6)
+
     def ball_outcome(row):
-        if row["is_wicket"] and row["runs_of_bat"] == 0:
+        if row["is_wicket"]:
             return "W"
-        return str(int(row["runs_of_bat"]))
+        runs = int(row["runs_of_bat"])
+        if runs not in _STANDARD_RUNS:
+            runs = min(_STANDARD_RUNS, key=lambda x: abs(x - runs))
+        return str(runs)
 
     df["outcome"] = df.apply(ball_outcome, axis=1)
 
@@ -69,16 +88,57 @@ def clean(df: pd.DataFrame) -> pd.DataFrame:
     decay_rate = np.log(2) / HALF_LIFE
     df["season_weight"] = np.exp(-decay_rate * (max_season - df["season"]))
 
-    # ── Fill missing strings (except venue — canonicalized/filtered next) ────
+    # ── Fill missing strings (except venue/team — canonicalized next) ────────
     for col in ["batting_team", "bowling_team", "striker", "bowler"]:
         df[col] = df[col].fillna("Unknown").str.strip()
 
-    # ── Restrict to the 13 target venues ─────────────────────────────────────
-    # Run once with DIAGNOSE_UNMAPPED_VENUES=True to check for un-recognized
-    # spelling variants in your raw data before trusting this filter.
+    # ── Canonicalize team names ───────────────────────────────────────────────
+    # Same rationale as venue canonicalization below: without this, franchise
+    # renames (Delhi Daredevils/Delhi Capitals, Kings XI Punjab/Punjab Kings,
+    # RCB's city-spelling change, short codes like "CSK" vs full names, etc.)
+    # silently fragment one team's history into multiple buckets — for
+    # batting_team/bowling_team encoding, team-level features, AND
+    # prepare_data.py's batters_by_team/bowlers_by_team roster grouping.
+
+    for col in ["batting_team", "bowling_team"]:
+        canon = df[col].map(canonicalize_team)
+        # Rows whose team string isn't a known franchise/alias keep their
+        # original ("Unknown" or the raw string) rather than becoming NaN —
+        # unlike venues, we don't drop rows here, since a batting_team we
+        # can't canonicalize doesn't invalidate the delivery the way an
+        # off-allowlist venue does.
+        df[col] = canon.where(canon.notna(), df[col])
+
     if DIAGNOSE_UNMAPPED_VENUES:
-        print_unmapped_venues(df, venue_col="venue")
-    df = filter_to_allowed_venues(df, venue_col="venue")
+        print_unmapped_teams(df)
+
+    ALLOWED_VENUES = [
+        "MA Chidambaram Stadium, Chennai",
+        "Wankhede Stadium, Mumbai",
+        "Arun Jaitley Stadium, Delhi",
+        "Eden Gardens, Kolkata",
+        "Narendra Modi Stadium, Ahmedabad",
+        "Shaheed Veer Narayan Singh International Stadium, Raipur",
+        "Barsapara Cricket Stadium, Guwahati",
+        "Dr. Y.S. Rajasekhara Reddy ACA-VDCA Cricket Stadium, Visakhapatnam",
+        "Rajiv Gandhi International Stadium, Hyderabad",
+        "M Chinnaswamy Stadium, Bengaluru",
+        "Bharat Ratna Shri Atal Bihari Vajpayee Ekana Cricket Stadium, Lucknow",
+        "Sawai Mansingh Stadium, Jaipur",
+        "Himachal Pradesh Cricket Association Stadium, Dharamsala",
+        "Maharaja Yadavindra Singh International Cricket Stadium, New Chandigarh",
+    ]
+
+    before = len(df)
+    df = df[df["venue"].isin(ALLOWED_VENUES)].reset_index(drop=True)
+
+    print(
+        f"Venue filter: {before:,} rows → {len(df):,} rows "
+        f"({before - len(df):,} dropped — venue not in the allowed list)"
+    )
+
+    for venue in ALLOWED_VENUES:
+        print(f"    {venue:<70} {(df['venue'] == venue).sum():,} deliveries")
 
     # ── Drop deliveries with missing critical fields ─────────────────────────
     df.dropna(subset=["striker", "bowler", "innings", "over"], inplace=True)

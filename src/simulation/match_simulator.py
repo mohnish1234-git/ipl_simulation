@@ -11,20 +11,64 @@ Context dict passed to predictor now includes all 7 feature groups:
   - Batting context / pressure     (computed live)
 """
 
+import contextlib
 import random
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from src.model.predictor import load_predictor
-from src.simulation.player_profiles import (
-    BatterArchetype, BowlerArchetype,
-    classify_batter, classify_bowler,
-    compute_risk_index, apply_risk_adjustment
-)
+from src.simulation.player_profiles import apply_collapse_adjustment
 
 # ── Outcome encoding (for prev_ball_outcome features) ─────────────────────────
 _OUTCOME_ENCODE = {"0": 0, "1": 1, "2": 2, "3": 3, "4": 4, "6": 6, "W": 7}
+
+# Must match the SAME normalization feature_engineer.py's build_features()
+# divides pressure_index by (see _modern_par_run_rate_by_season / modern_par_rr)
+# — a recency-weighted average 1st-innings run rate (runs/over) computed from
+# PRIOR completed seasons. At live-simulation time there's no "season" to
+# look this up per-row the way training does; this is the most recent
+# season's value from that same computation, i.e. today's scoring
+# environment. If you regenerate models/ after a season with materially
+# different scoring, recompute this from prepare_data.py's
+# _modern_par_run_rate_by_season() output (its latest entry) rather than
+# hand-editing it, or the pressure_index scale will drift from what the
+# model was actually trained on again.
+MODERN_PAR_RR = 8.6
+
+# Must match feature_engineer.py's BVB_OTHER_SHRINK_K / BVB_DISMISSAL_SHRINK_K
+# exactly — this is the LIVE-inference counterpart of the same shrinkage the
+# training pipeline applies to BvB (batter-vs-bowler) stats. Duplicated here
+# rather than imported because match_simulator.py and feature_engineer.py
+# live in different packages (src.simulation vs the offline data-prep code)
+# with no shared dependency between them; if either K value changes, update
+# both places.
+BVB_OTHER_SHRINK_K     = 15.0   # sr / dot% / boundary% / six%
+BVB_DISMISSAL_SHRINK_K = 40.0   # dismissal% only
+
+# ── Extras sampling — fixed empirical rates computed from the user's own
+#    cleaned.csv (raw["wide"], raw["noballs"], raw["byes"], raw["legbyes"]).
+#    Not retrained into the model; applied as a pre-model layer so the
+#    XGBoost model only ever sees genuine legal deliveries, exactly as
+#    it was trained. ────────────────────────────────────────────────────────
+EXTRA_RATES = {
+    "wide":   0.0332,
+    "noball": 0.00415,
+    "bye":    0.00251,
+    "legbye": 0.01486,
+}
+WIDE_BOUNDARY_RATE = 0.0   # data showed this never happens — kept at 0, no nested check needed
+BYE_RUN_DIST = {1: 0.70, 2: 0.20, 4: 0.08, 5: 0.02}
+
+
+def _sample_extra() -> str:
+    r = random.random()
+    cum = 0.0
+    for kind, p in EXTRA_RATES.items():
+        cum += p
+        if r < cum:
+            return kind
+    return "none"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -70,6 +114,14 @@ class InningsState:
     innings_num:     int = 1
     target:          Optional[int] = None
 
+    # Par run rate used to normalize pressure_index, matching training's
+    # modern_par_rr — sourced from meta.json when available (see
+    # StatsStore.modern_par_rr), falling back to MODERN_PAR_RR otherwise.
+    # Kept per-innings-state (not just the global constant) so a future
+    # multi-era/multi-competition setup could vary it per match without
+    # touching this class.
+    par_rr: float = MODERN_PAR_RR
+
     score:       int = 0
     wickets:     int = 0
     legal_balls: int = 0
@@ -95,9 +147,21 @@ class InningsState:
     batter_innings_balls: Dict[str, int] = field(default_factory=dict)
     batter_innings_runs:  Dict[str, int] = field(default_factory=dict)
 
-    # per-bowler in-match stats (this innings)
+    # per-bowler in-match stats (this innings) — bowler's OWN whole-innings
+    # figures, aggregated across every batter they've faced. Kept for the
+    # bowler's own state/economy tracking (BowlerState); NOT the same thing
+    # as the batter-specific "vs this bowler, this innings" feature below.
     bowler_innings_balls: Dict[str, int] = field(default_factory=dict)
     bowler_innings_runs:  Dict[str, int] = field(default_factory=dict)
+
+    # per-(batter, bowler) PAIR in-match stats — this is what feature_engineer.py
+    # actually means by "balls_vs_bowler" / "runs_vs_bowler" / "current_matchup_sr"
+    # (see its per-row loop: pair_key = (striker, bowler)). Previously this was
+    # read off bowler_innings_balls/runs instead — the bowler's aggregate across
+    # ALL batters — so every batter facing the same bowler in an innings got an
+    # IDENTICAL value for what was supposed to be a batter-specific signal.
+    pair_balls: Dict[Tuple[str, str], int] = field(default_factory=dict)
+    pair_runs:  Dict[Tuple[str, str], int] = field(default_factory=dict)
 
     # partnership
     partnership_runs:  int = 0
@@ -133,7 +197,20 @@ class InningsState:
 
     @property
     def pressure_index(self) -> float:
-        return round(self.rrr - self.crr, 2) if self.innings_num == 2 else 0.0
+        # MUST match feature_engineer.py's training formula exactly:
+        #   pressure_index = (rrr - crr) / modern_par_rr
+        # This division was added to training when modern_par_rr was
+        # introduced, but was never carried over here — pressure_index (and
+        # everything downstream of it, like pressure_weighted_aggression)
+        # was being fed to the model RAW, at roughly 8-9x the scale it was
+        # ever trained on (the model only ever saw values normalized into
+        # roughly [-2, +3]; raw (rrr-crr) routinely swings [-20, +20] in a
+        # real chase). That's a heavily-weighted numeric feature landing
+        # far outside the model's trained range on every single ball of
+        # every second-innings simulation — exactly the kind of thing that
+        # produces wild, unrealistic ball-outcome predictions in either
+        # direction (no-boundary 2s-and-3s streaks, rapid collapses).
+        return round((self.rrr - self.crr) / self.par_rr, 2) if self.innings_num == 2 else 0.0
 
     def striker(self) -> str:
         return self.batting_order[self.striker_idx]
@@ -151,8 +228,18 @@ class InningsState:
     def runs_last6(self) -> int:
         return int(sum(self.legal_ball_runs[-6:]))
 
+    def runs_last12(self) -> int:
+        return int(sum(self.legal_ball_runs[-12:]))
+
+    def runs_last18(self) -> int:
+        return int(sum(self.legal_ball_runs[-18:]))
+
     def runs_last_over(self, over: int) -> int:
         return int(self.over_runs.get(over - 1, 0))
+
+    @property
+    def partnership_run_rate(self) -> float:
+        return round(self.partnership_runs / self.partnership_balls * 6, 2) if self.partnership_balls else 0.0
 
     def prev_outcome(self, n: int) -> int:
         hist = self.outcome_history
@@ -197,23 +284,49 @@ class StatsStore:
         bat_rw_avg=1.28, bat_rw_sr=128.0,
         bat_rw_boundary_pct=0.15, bat_rw_six_pct=0.06, bat_rw_dot_pct=0.33,
         bat_pp_rw_sr=125.0, bat_mid_rw_sr=130.0, bat_death_rw_sr=145.0,
-        bat_pp_rw_boundary_pct=0.14, bat_death_rw_boundary_pct=0.22,
+        bat_pp_rw_boundary_pct=0.14, bat_mid_rw_boundary_pct=0.15,
+        bat_death_rw_boundary_pct=0.22,
+        # These three were missing here too — trained-on features that must
+        # exist on every batter dict (real or default), or they zero-fill
+        # for whichever players fall back to DEFAULT_BATTER.
+        bat_pp_rw_dot_pct=0.33, bat_mid_rw_dot_pct=0.33, bat_death_rw_dot_pct=0.30,
     )
     DEFAULT_BOWLER = dict(
         bowl_rw_economy=8.2, bowl_rw_wicket_pct=0.055, bowl_rw_dot_pct=0.33,
         bowl_rw_boundary_pct=0.15,
         bowl_pp_rw_economy=7.5, bowl_mid_rw_economy=8.0, bowl_death_rw_economy=9.2,
-        bowl_pp_rw_wicket_pct=0.07, bowl_death_rw_wicket_pct=0.055,
+        bowl_pp_rw_wicket_pct=0.07, bowl_mid_rw_wicket_pct=0.05,
+        bowl_death_rw_wicket_pct=0.055,
+        bowl_pp_rw_dot_pct=0.35, bowl_mid_rw_dot_pct=0.33, bowl_death_rw_dot_pct=0.28,
+        bowl_pp_rw_boundary_pct=0.14, bowl_mid_rw_boundary_pct=0.15,
+        bowl_death_rw_boundary_pct=0.20,
     )
     DEFAULT_BVB = dict(
         bvb_balls=0, bvb_rw_sr=128.0, bvb_rw_dismissal_pct=0.05,
         bvb_rw_dot_pct=0.33, bvb_rw_boundary_pct=0.15, bvb_rw_six_pct=0.06,
+        # Over-band split (1-6/7-10/11-15/16-20) — trained on but, before
+        # prepare_data.py's over-band export existed, never supplied here
+        # either, so every ball for an unmatched pair zero-filled all 8 of
+        # these via predictor.py's reindex(fill_value=0). Falls back to the
+        # same flat career-ish numbers as the rest of DEFAULT_BVB.
+        bvb_1_6_sr=128.0, bvb_1_6_avg=26.0,
+        bvb_7_10_sr=128.0, bvb_7_10_avg=26.0,
+        bvb_11_15_sr=128.0, bvb_11_15_avg=26.0,
+        bvb_16_20_sr=145.0, bvb_16_20_avg=22.0,
     )
     DEFAULT_VENUE = dict(
         venue_rw_avg_1st_innings=165.0, venue_rw_avg_2nd_innings=155.0,
         venue_rw_boundary_pct=0.17, venue_rw_six_pct=0.08,
         venue_rw_dot_pct=0.31, venue_rw_wicket_pct=0.054,
         venue_rw_pp_sr=140.0, venue_rw_death_sr=165.0,
+        # Over-band venue character — same missing-column issue as above,
+        # for the 8 venue_rw_{band}_rr / venue_rw_{band}_wicket_pct columns.
+        # rr values interpolate roughly powerplay -> death; wicket_pct held
+        # at the flat league-average default.
+        venue_rw_1_6_rr=8.2,   venue_rw_1_6_wicket_pct=0.054,
+        venue_rw_7_10_rr=8.4,  venue_rw_7_10_wicket_pct=0.054,
+        venue_rw_11_15_rr=8.8, venue_rw_11_15_wicket_pct=0.054,
+        venue_rw_16_20_rr=9.9, venue_rw_16_20_wicket_pct=0.054,
     )
 
     def __init__(self):
@@ -223,7 +336,14 @@ class StatsStore:
         self._venue:  Dict[str, dict] = {}
         self._batter_venue: Dict[Tuple, dict] = {}   # (batter, venue) -> stats
         self._bowler_venue: Dict[Tuple, dict] = {}   # (bowler, venue) -> stats
-        self.archetype_thresholds = None   # fit lazily once player stats are loaded
+        self._tailender_default: dict = {}            # ← was missing; batter() reads
+                                                        #   this even when load_from_csv()
+                                                        #   is never called or the file
+                                                        #   is absent, so it must always exist
+        # Falls back to the MODERN_PAR_RR module constant unless meta.json
+        # (written by prepare_data.py) supplies the real recency-weighted
+        # value for the latest season — see load_from_csv() below.
+        self.modern_par_rr: float = MODERN_PAR_RR
 
     def load_from_csv(self, processed_dir: str = "data/processed"):
         """
@@ -261,24 +381,114 @@ class StatsStore:
                 print(f"  ⚠ {fname} not found — {attr} will fall back to career "
                       f"stats / defaults for every player")
 
-        # Fit archetype cutoffs from the ACTUAL loaded player pool rather than
-        # relying on hardcoded absolute numbers — see player_profiles.py for why.
-        from src.simulation.player_profiles import fit_archetype_thresholds
-        self.archetype_thresholds = fit_archetype_thresholds(self._batter)
-        print(f"  Fitted archetype thresholds from {len(self._batter)} batters: "
-              f"{self.archetype_thresholds}")
+        tpath = p / "tailender_default.json"
+        if tpath.exists():
+            with open(tpath) as f:
+                self._tailender_default = json.load(f)
+            print(f"  Loaded tailender_default.json ({len(self._tailender_default)} stats)")
+        else:
+            print("  ⚠ tailender_default.json not found — bowlers with no batting "
+                  "record will fall back to DEFAULT_BATTER (league average)")
+
+        mpath = p / "meta.json"
+        if mpath.exists():
+            with open(mpath) as f:
+                meta = json.load(f)
+            if "modern_par_rr" in meta:
+                self.modern_par_rr = float(meta["modern_par_rr"])
+                print(f"  Loaded modern_par_rr from meta.json: {self.modern_par_rr:.3f} "
+                      f"(overrides the {MODERN_PAR_RR} module default)")
+            else:
+                print(f"  ⚠ meta.json has no modern_par_rr — pressure_index will "
+                      f"normalize against the {MODERN_PAR_RR} module default instead "
+                      f"of the actual recency-weighted current-season value")
+        else:
+            print(f"  ⚠ meta.json not found — pressure_index will normalize against "
+                  f"the {MODERN_PAR_RR} module default instead of the actual "
+                  f"recency-weighted current-season value")
 
     def batter(self, name: str) -> dict:
-        return self._batter.get(name, self.DEFAULT_BATTER)
+        hit = self._batter.get(name)
+        if hit is not None:
+            return hit
+        if name in self._bowler and self._tailender_default:
+            return self._tailender_default
+        return self.DEFAULT_BATTER
 
     def bowler(self, name: str) -> dict:
         return self._bowler.get(name, self.DEFAULT_BOWLER)
 
     def bvb(self, batter: str, bowler: str) -> dict:
-        return self._bvb.get((batter, bowler), self.DEFAULT_BVB)
+        """Falls back to blending toward THIS batter's/bowler's own career
+        stats — not a hardcoded generic default — matching feature_engineer.py's
+        BVB_OTHER_SHRINK_K / BVB_DISMISSAL_SHRINK_K blend, and batter_venue()/
+        bowler_venue()'s "fall back to the real player, not a league constant"
+        pattern above.
+
+        Previously this did a bare dict lookup: DEFAULT_BVB (flat SR=128.0,
+        dismissal%=0.05, etc., regardless of who's actually batting/bowling)
+        for an unseen pair, and — worse — trusted a RAW matchup entry
+        completely even if it was based on only 1-2 real balls. A batter who's
+        faced a given bowler only a couple of times, by chance including a
+        dismissal, would show a wildly elevated bvb_rw_dismissal_pct with
+        nothing to pull it back toward reality — exactly the extreme
+        wicket-probability spikes seen for lightly-matched-up pairs.
+        """
+        raw = self._bvb.get((batter, bowler))
+        career_bat  = self.batter(batter)
+        career_bowl = self.bowler(bowler)
+
+        fallback_sr       = career_bat.get("bat_rw_sr", self.DEFAULT_BATTER["bat_rw_sr"])
+        fallback_avg      = career_bat.get("bat_rw_avg", self.DEFAULT_BATTER.get("bat_rw_avg", 26.0))
+        fallback_dot      = career_bat.get("bat_rw_dot_pct", self.DEFAULT_BATTER["bat_rw_dot_pct"])
+        fallback_boundary = career_bat.get("bat_rw_boundary_pct", self.DEFAULT_BATTER["bat_rw_boundary_pct"])
+        fallback_six      = career_bat.get("bat_rw_six_pct", self.DEFAULT_BATTER["bat_rw_six_pct"])
+        fallback_dismiss  = career_bowl.get("bowl_rw_wicket_pct", self.DEFAULT_BOWLER["bowl_rw_wicket_pct"])
+
+        out = {
+            "bvb_rw_sr": fallback_sr, "bvb_rw_dismissal_pct": fallback_dismiss,
+            "bvb_rw_dot_pct": fallback_dot, "bvb_rw_boundary_pct": fallback_boundary,
+            "bvb_rw_six_pct": fallback_six, "bvb_balls": 0.0,
+        }
+        for band_tag in ("1_6", "7_10", "11_15", "16_20"):
+            out[f"bvb_{band_tag}_sr"]  = fallback_sr
+            out[f"bvb_{band_tag}_avg"] = fallback_avg
+
+        if raw is None:
+            return out
+
+        balls = raw.get("bvb_balls", 0.0)
+        shrink_other   = balls / (balls + BVB_OTHER_SHRINK_K)
+        shrink_dismiss = balls / (balls + BVB_DISMISSAL_SHRINK_K)
+
+        out["bvb_balls"] = balls
+        out["bvb_rw_sr"] = (shrink_other * raw.get("bvb_rw_sr", fallback_sr)
+                             + (1 - shrink_other) * fallback_sr)
+        out["bvb_rw_dot_pct"] = (shrink_other * raw.get("bvb_rw_dot_pct", fallback_dot)
+                                  + (1 - shrink_other) * fallback_dot)
+        out["bvb_rw_boundary_pct"] = (shrink_other * raw.get("bvb_rw_boundary_pct", fallback_boundary)
+                                       + (1 - shrink_other) * fallback_boundary)
+        out["bvb_rw_six_pct"] = (shrink_other * raw.get("bvb_rw_six_pct", fallback_six)
+                                  + (1 - shrink_other) * fallback_six)
+        out["bvb_rw_dismissal_pct"] = (shrink_dismiss * raw.get("bvb_rw_dismissal_pct", fallback_dismiss)
+                                        + (1 - shrink_dismiss) * fallback_dismiss)
+        # Over-band split — same shrink factor as the top-level SR blend
+        # above; a raw sparse pairing doesn't have a separate per-band ball
+        # count to shrink against independently, so this is a reasonable
+        # single approximation rather than 4 separate (and even noisier) ones.
+        for band_tag in ("1_6", "7_10", "11_15", "16_20"):
+            out[f"bvb_{band_tag}_sr"] = (shrink_other * raw.get(f"bvb_{band_tag}_sr", fallback_sr)
+                                          + (1 - shrink_other) * fallback_sr)
+            out[f"bvb_{band_tag}_avg"] = (shrink_other * raw.get(f"bvb_{band_tag}_avg", fallback_avg)
+                                           + (1 - shrink_other) * fallback_avg)
+        return out
 
     def venue(self, v: str) -> dict:
-        return self._venue.get(v, self.DEFAULT_VENUE)
+        hit = self._venue.get(v)
+        if hit is None:
+            print(f"⚠ Venue lookup miss for '{v}' — using DEFAULT_VENUE "
+                  f"(generic league average, not this ground's real profile)")
+        return hit if hit is not None else self.DEFAULT_VENUE
 
     def batter_venue(self, name: str, venue: str) -> dict:
         """Highest-precedence tier. Falls back to this player's own career
@@ -290,12 +500,22 @@ class StatsStore:
         if hit is not None:
             return hit
         career = self.batter(name)
-        return {
-            "bat_venue_adj_sr": career.get("bat_rw_sr", self.DEFAULT_BATTER["bat_rw_sr"]),
+        adj_sr = career.get("bat_rw_sr", self.DEFAULT_BATTER["bat_rw_sr"])
+        adj_avg = career.get("bat_rw_avg", self.DEFAULT_BATTER.get("bat_rw_avg", 26.0))
+        out = {
+            "bat_venue_adj_sr": adj_sr,
             "bat_venue_adj_boundary_pct": career.get(
                 "bat_rw_boundary_pct", self.DEFAULT_BATTER["bat_rw_boundary_pct"]),
             "bat_venue_rw_balls": 0.0,
         }
+        # Over-band split — with no venue-specific history at all, fall all
+        # the way back to the player's own career SR/avg for every band
+        # (matches feature_engineer.py's shrink-to-0 behavior when
+        # bat_venue_{band}_balls is 0).
+        for band_tag in ("1_6", "7_10", "11_15", "16_20"):
+            out[f"bat_venue_{band_tag}_sr"] = adj_sr
+            out[f"bat_venue_{band_tag}_avg"] = adj_avg
+        return out
 
     def bowler_venue(self, name: str, venue: str) -> dict:
         """Same fallback logic as batter_venue(), for bowlers."""
@@ -303,13 +523,19 @@ class StatsStore:
         if hit is not None:
             return hit
         career = self.bowler(name)
-        return {
-            "bowl_venue_adj_economy": career.get(
-                "bowl_rw_economy", self.DEFAULT_BOWLER["bowl_rw_economy"]),
-            "bowl_venue_adj_wicket_pct": career.get(
-                "bowl_rw_wicket_pct", self.DEFAULT_BOWLER["bowl_rw_wicket_pct"]),
+        adj_econ = career.get("bowl_rw_economy", self.DEFAULT_BOWLER["bowl_rw_economy"])
+        adj_wkt = career.get("bowl_rw_wicket_pct", self.DEFAULT_BOWLER["bowl_rw_wicket_pct"])
+        out = {
+            "bowl_venue_adj_economy": adj_econ,
+            "bowl_venue_adj_wicket_pct": adj_wkt,
             "bowl_venue_rw_balls": 0.0,
         }
+        # Over-band split — same career-only fallback rationale as
+        # batter_venue() above.
+        for band_tag in ("1_6", "7_10", "11_15", "16_20"):
+            out[f"bowl_venue_{band_tag}_economy"] = adj_econ
+            out[f"bowl_venue_{band_tag}_wicket_pct"] = adj_wkt
+        return out
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -336,9 +562,11 @@ class MatchSimulator:
     )
     """
 
-    def __init__(self, predictor=None, stats_store: Optional[StatsStore] = None):
+    def __init__(self, predictor=None, stats_store: Optional[StatsStore] = None,
+                 verbose: bool = False):
         self.predictor   = predictor or load_predictor()
         self.stats_store = stats_store or StatsStore()
+        self.verbose      = verbose
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -354,6 +582,19 @@ class MatchSimulator:
         toss_winner: str = None,
         toss_choice: str = "bat",
     ) -> MatchResult:
+
+        # No canonicalization/allowlist here anymore — venue_mapping.py was
+        # solving a naming-variant problem this dataset doesn't actually
+        # have. venue is used exactly as passed in (cleaner.py already
+        # normalized whitespace at data-prep time). If it's a venue with no
+        # stats on file (typo, or a ground genuinely absent from training
+        # data), stats_store.venue() falls back to DEFAULT_VENUE rather than
+        # erroring — that's a soft degrade worth knowing about, so we warn
+        # instead of silently proceeding.
+        venue = str(venue).strip()
+        if venue not in self.stats_store._venue:
+            print(f"⚠ No venue stats on file for '{venue}' — falling back to "
+                  f"DEFAULT_VENUE (league-average profile) for this match.")
 
         if toss_winner == team2 and toss_choice == "bat":
             batting_first, batting_second   = team2, team1
@@ -385,6 +626,10 @@ class MatchSimulator:
             win_type  = "runs"
             win_margin = inn1.score - inn2.score
 
+        if self.verbose:
+            print(f"\n{'=' * 60}\nFINAL: {batting_first} {inn1.score}/{inn1.wickets}  vs  "
+                  f"{batting_second} {inn2.score}/{inn2.wickets}\n{'=' * 60}")
+
         return MatchResult(
             batting_team_1=batting_first, batting_team_2=batting_second,
             score_1=inn1.score, score_2=inn2.score,
@@ -396,6 +641,34 @@ class MatchSimulator:
             bowler_stats_1={n: v.__dict__ for n, v in inn1.bowler_states.items()},
             bowler_stats_2={n: v.__dict__ for n, v in inn2.bowler_states.items()},
         )
+
+    def _log_ball(self, state, over, ball_in_over, striker, bowler_name,
+                   outcome, runs, extras, is_wicket, probs):
+        """The ONE place ball-by-ball prediction output gets printed.
+
+        Previously there were three overlapping print mechanisms: an
+        unconditional full-context-dict dump that fired on every ball
+        regardless of the verbose flag (extremely noisy — this is what
+        produced hundred-line-per-ball logs), a separate _print_ball()
+        called mid-branch for only two of the four extra_kind branches, and
+        a third, redundant end-of-ball summary line. Consolidated into this
+        single verbose-gated call site so every ball — including wides/
+        byes/leg-byes, which never call the model — gets exactly one clean
+        line plus (when the model was actually called) its full predicted
+        distribution.
+        """
+        header = (f"[Inn{state.innings_num}] {over}.{ball_in_over}  "
+                  f"{striker} vs {bowler_name}  "
+                  f"[{state.batting_team} {state.score}/{state.wickets}]")
+        print(header)
+        if probs is not None:
+            ranked = sorted(probs.items(), key=lambda kv: -kv[1])
+            dist = "  ".join(f"{k}:{v:.3f}" for k, v in ranked)
+            print(f"    model probs -> {dist}")
+        else:
+            print("    (extra delivery — sampled from EXTRA_RATES, model not called)")
+        print(f"    result -> {outcome}  (runs={runs}, extras={extras}, "
+              f"wicket={is_wicket})  score={state.score}/{state.wickets}")
 
     # ── Innings simulation ────────────────────────────────────────────────────
 
@@ -415,6 +688,7 @@ class MatchSimulator:
             batting_order=list(batting_order),
             bowling_rotation=list(bowling_rotation),
             venue=venue, innings_num=innings_num, target=target,
+            par_rr=self.stats_store.modern_par_rr,
         )
         for i in range(min(2, len(state.batting_order))):
             name = state.batting_order[i]
@@ -480,14 +754,23 @@ class MatchSimulator:
                 "batter_balls_faced":   state.batter_innings_balls.get(striker, 0),
                 "batter_runs_scored":   state.batter_innings_runs.get(striker, 0),
                 "batter_innings_sr":    _innings_sr(state, striker),
-                "balls_vs_bowler":      state.bowler_innings_balls.get(bowler_name, 0),
-                "runs_vs_bowler":       state.bowler_innings_runs.get(bowler_name, 0),
+                # batter-specific "this matchup, this innings" — keyed on the
+                # (striker, bowler) PAIR, matching feature_engineer.py. Was
+                # previously the bowler's whole-innings aggregate across every
+                # batter, which made this feature identical for every batter
+                # facing the same bowler (see InningsState.pair_balls/pair_runs).
+                "balls_vs_bowler":      state.pair_balls.get((striker, bowler_name), 0),
+                "runs_vs_bowler":       state.pair_runs.get((striker, bowler_name), 0),
+                "current_matchup_sr":   _current_matchup_sr(state, striker, bowler_name),
                 "runs_last6":           state.runs_last6(),
+                "runs_last12":          state.runs_last12(),
+                "runs_last18":          state.runs_last18(),
                 "runs_last_over":       state.runs_last_over(over),
                 "consec_dots":          state.consec_dots,
                 "consec_boundaries":    state.consec_boundaries,
                 "partnership_runs":     state.partnership_runs,
                 "partnership_balls":    state.partnership_balls,
+                "partnership_run_rate": state.partnership_run_rate,
                 "prev_ball_outcome":    state.prev_outcome(1),
                 "prev2_ball_outcome":   state.prev_outcome(2),
                 "prev3_ball_outcome":   state.prev_outcome(3),
@@ -500,36 +783,88 @@ class MatchSimulator:
                 "runs_needed":      state.runs_needed,
                 "rrr":              state.rrr,
                 "pressure_index":   state.pressure_index,
+                # These 4 were trained on (feature_engineer.py's "batting
+                # context / pressure" group) but never supplied here — every
+                # prediction was silently zero-filling them via predictor.py's
+                # reindex(fill_value=0), which especially hurts realism of
+                # second-innings chases (wickets-in-hand-adjusted pressure).
+                # Formulas match feature_engineer.py exactly, computed from
+                # the same state properties already used above.
+                "required_runs_per_wicket": (
+                    round(state.runs_needed / state.wickets_remaining, 2)
+                    if state.innings_num == 2 and state.wickets_remaining > 0 else 0.0
+                ),
+                "balls_per_required_run": (
+                    round(state.balls_remaining / state.runs_needed, 2)
+                    if state.innings_num == 2 and state.runs_needed > 0
+                    else state.balls_remaining
+                ),
+                "pressure_weighted_rrr": (
+                    round(state.rrr * (1 + (10 - state.wickets_remaining) / 10), 2)
+                    if state.innings_num == 2 else 0.0
+                ),
+                "pressure_weighted_aggression": (
+                    round(state.pressure_index * (state.wickets_remaining / 10), 2)
+                    if state.innings_num == 2 else 0.0
+                ),
             }
 
-            probs   = self.predictor.predict_proba(ctx)
+            # ── Extras layer — sampled BEFORE the model is ever called, from
+            #    fixed empirical rates. Only "none" reaches predict_proba(),
+            #    which keeps the model exactly in the domain it was trained
+            #    on (legal deliveries only). ──────────────────────────────────
+            extra_kind = _sample_extra()
+            probs = None   # stays None for wide/bye/legbye — no model call happens for those
+            if extra_kind == "wide":
+                runs, is_wicket, is_wide, is_noball = 0, False, True, False
+                extras_this_ball = 1
+                outcome = "wide+1"
 
-            # ── Apply Archetype & Risk Overlays ───────────────────────────────
-            batter_arch = classify_batter(bs, self.stats_store.archetype_thresholds)
-            bowler_arch = classify_bowler(bls)
-            risk = compute_risk_index(
-                archetype=batter_arch,
-                over=over,
-                balls_faced_this_innings=state.batter_innings_balls.get(striker, 0),
-                is_chasing=state.innings_num == 2,
-                pressure_index=state.pressure_index,
-                partnership_balls=state.partnership_balls,
-                bowler_archetype=bowler_arch,
-                venue_stats=vs,
-            )
-            probs = apply_risk_adjustment(probs, risk)
-            # ──────────────────────────────────────────────────────────────────
+            elif extra_kind == "noball":
+                # No-ball: 1 automatic extra, but the batter can still score
+                # off the bat, so the model IS still called for that part.
+                probs = self.predictor.predict_proba(ctx)
+                probs = apply_collapse_adjustment(probs, state.wickets, over)
+                bat_outcome = _sample_outcome(probs)
+                bat_runs, _, _, _ = _parse_outcome(bat_outcome)
+                runs, is_wicket, is_wide, is_noball = bat_runs, False, False, True
+                extras_this_ball = 1
+                outcome = f"noball+{bat_runs}"
 
-            outcome = _sample_outcome(probs)
-            runs, is_wicket, is_wide, is_noball = _parse_outcome(outcome)
+            elif extra_kind in ("bye", "legbye"):
+                bye_runs = random.choices(
+                    list(BYE_RUN_DIST.keys()), weights=list(BYE_RUN_DIST.values()), k=1
+                )[0]
+                runs, is_wicket, is_wide, is_noball = 0, False, False, False  # legal ball
+                extras_this_ball = bye_runs
+                outcome = f"{extra_kind}+{bye_runs}"
+
+            else:
+                probs = self.predictor.predict_proba(ctx)
+                probs = apply_collapse_adjustment(probs, state.wickets, over)
+                outcome = _sample_outcome(probs)
+                print("\n" + "=" * 70)
+                print(f"Ball : {over}.{ball_in_over}")
+                print(f"{striker} vs {bowler_name}")
+
+                print("\nPredicted Probabilities")
+                for k, v in sorted(probs.items()):
+                    print(f"{k:>2} : {v:.4%}")
+
+                print(f"\nSelected Outcome : {outcome}")
+                print("=" * 70)
+                runs, is_wicket, is_wide, is_noball = _parse_outcome(outcome)
+                extras_this_ball = 0
 
             # ── Update batter state ───────────────────────────────────────────
             striker_state = state.batter_states[striker]
             if not is_wide:
                 striker_state.balls += 1
                 state.batter_innings_balls[striker] = state.batter_innings_balls.get(striker, 0) + 1
-            striker_state.runs += runs
-            state.batter_innings_runs[striker] = state.batter_innings_runs.get(striker, 0) + runs
+            if extra_kind not in ("bye", "legbye"):
+                # byes/leg-byes are not credited to the batter's own runs
+                striker_state.runs += runs
+                state.batter_innings_runs[striker] = state.batter_innings_runs.get(striker, 0) + runs
             if runs == 4: striker_state.fours += 1
             if runs == 6: striker_state.sixes += 1
 
@@ -540,13 +875,26 @@ class MatchSimulator:
             if is_wide:   bstate.wides   += 1
             if is_noball: bstate.noballs += 1
 
-            extras = 1 if (is_wide or is_noball) else 0
+            extras = extras_this_ball
             state.score  += runs + extras
             state.extras += extras
 
             bowl_runs_this = runs + extras
             state.bowler_innings_balls[bowler_name] = state.bowler_innings_balls.get(bowler_name, 0) + (0 if is_wide else 1)
             state.bowler_innings_runs[bowler_name]  = state.bowler_innings_runs.get(bowler_name, 0) + bowl_runs_this
+
+            # ── pair-level (batter, bowler) tracking — this is what actually
+            #    feeds balls_vs_bowler / runs_vs_bowler / current_matchup_sr.
+            #    Wides don't count as a ball faced by the striker; runs off
+            #    the bat still count toward the pair (matching feature_engineer's
+            #    per-row loop, which only advances on legal deliveries the
+            #    striker faced — byes/leg-byes aren't credited to the batter
+            #    there either, so mirror that here). ─────────────────────────
+            pair_key = (striker, bowler_name)
+            if not is_wide:
+                state.pair_balls[pair_key] = state.pair_balls.get(pair_key, 0) + 1
+            if extra_kind not in ("bye", "legbye"):
+                state.pair_runs[pair_key] = state.pair_runs.get(pair_key, 0) + runs
 
             # ── Wicket ────────────────────────────────────────────────────────
             if is_wicket:
@@ -601,13 +949,18 @@ class MatchSimulator:
                 "outcome": outcome, "runs": runs, "extras": extras,
                 "is_wicket": is_wicket,
                 "score": state.score, "wickets": state.wickets,
+                "probs": probs,   # None for wide/bye/legbye; real dict for noball/normal balls
             })
+
+            if self.verbose:
+                self._log_ball(state, over, ball_in_over, striker, bowler_name,
+                                outcome, runs, extras, is_wicket, probs)
 
         # end-of-over: swap strike
         state.striker_idx, state.non_striker_idx = (
             state.non_striker_idx, state.striker_idx
         )
-
+    
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Helpers
@@ -623,6 +976,16 @@ def _innings_sr(state: InningsState, striker: str) -> float:
     b = state.batter_innings_balls.get(striker, 0)
     r = state.batter_innings_runs.get(striker, 0)
     return round(r / b * 100, 1) if b > 0 else 0.0
+
+
+def _current_matchup_sr(state: InningsState, striker: str, bowler_name: str) -> float:
+    """Strike rate for THIS batter against THIS bowler so far in THIS innings —
+    matches feature_engineer.py's `current_matchup_sr` (computed from the same
+    (striker, bowler) pair_balls/pair_runs the model was trained on)."""
+    key = (striker, bowler_name)
+    b = state.pair_balls.get(key, 0)
+    r = state.pair_runs.get(key, 0)
+    return round(r / b * 100, 2) if b > 0 else 0.0
 
 
 def _sample_outcome(probs: Dict[str, float]) -> str:

@@ -13,16 +13,20 @@ from typing import List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
+# Force UTF-8 output on Windows — prevents UnicodeEncodeError from ⚠ / ✓ chars
+# printed during model/stats loading on cp1252 consoles.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from src.model.predictor import load_predictor
 from src.simulation.match_simulator import MatchSimulator, StatsStore
-"""from src.simulation.monte_carlo import run_monte_carlo
-from src.optimization.team_optimizer import (
-    Player, optimize_batting_order, optimize_bowling_rotation, dream11_optimize
-)"""
+from src.simulation.monte_carlo import run_monte_carlo
 
 # ── App setup ─────────────────────────────────────────────────────────────────
 
@@ -195,14 +199,12 @@ def simulate_match(req: SimulateRequest):
         if ball["probs"]:
             for outcome, prob in sorted(ball["probs"].items()):
                 print(f"{outcome:>3} : {prob:.4f}")
-"""
-@app.post("/monte-carlo")
 
+@app.post("/monte-carlo")
 def monte_carlo(req: MonteCarloRequest):
-    Run N simulations and return aggregated win probabilities and projections.
+    """Run N simulations and return aggregated win probabilities, top players, and score stats."""
     try:
         mc = run_monte_carlo(
-            simulator=simulator,
             team1=req.team1,
             team2=req.team2,
             batting_order_1=req.batting_order_1,
@@ -210,72 +212,74 @@ def monte_carlo(req: MonteCarloRequest):
             bowling_rotation_1=req.bowling_rotation_1,
             bowling_rotation_2=req.bowling_rotation_2,
             venue=req.venue,
-            n_simulations=req.n_simulations,
-            n_workers=req.n_workers,
-            verbose=False,
+            num_simulations=req.n_simulations,
+            toss_winner=req.toss_winner,
+            toss_choice=req.toss_choice,
+            predictor=predictor,
+            stats_store=stats_store,
         )
+
+        # ── Derive most probable winner ───────────────────────────────────────
+        if mc.team1_win_pct >= mc.team2_win_pct:
+            most_probable_winner = mc.team1
+            winner_pct = mc.team1_win_pct
+        else:
+            most_probable_winner = mc.team2
+            winner_pct = mc.team2_win_pct
+
+        # ── Top 3 batters (highest mean runs across all simulations) ──────────
+        batters_ranked = sorted(
+            [s for s in mc.player_summaries if s.get("batting") and s["batting"].get("mean_runs", 0) > 0],
+            key=lambda s: s["batting"]["mean_runs"],
+            reverse=True,
+        )
+        top3_batters = [
+            {
+                "player": s["player"],
+                "mean_runs": s["batting"]["mean_runs"],
+                "p90_runs": s["batting"]["p90_runs"],
+                "mean_balls_faced": s["batting"]["mean_balls_faced"],
+            }
+            for s in batters_ranked[:3]
+        ]
+
+        # ── Top 3 bowlers (highest mean wickets across all simulations) ───────
+        bowlers_ranked = sorted(
+            [s for s in mc.player_summaries if s.get("bowling") and s["bowling"].get("mean_wickets", 0) > 0],
+            key=lambda s: s["bowling"]["mean_wickets"],
+            reverse=True,
+        )
+        top3_bowlers = [
+            {
+                "player": s["player"],
+                "mean_wickets": s["bowling"]["mean_wickets"],
+                "p90_wickets": s["bowling"]["p90_wickets"],
+                "mean_economy": s["bowling"]["mean_economy"],
+            }
+            for s in bowlers_ranked[:3]
+        ]
+
         return {
-            "n_simulations":    mc.n_simulations,
-            "team1":            mc.team1,
-            "team2":            mc.team2,
-            "team1_win_prob":   mc.team1_win_prob,
-            "team2_win_prob":   mc.team2_win_prob,
-            "score_summary": {
-                mc.team1: {
-                    "avg": mc.avg_score_1, "std": mc.std_score_1,
-                    "p10": mc.score_p10_1, "p50": mc.score_p50_1,
-                    "p90": mc.score_p90_1, "distribution": mc.score_dist_1,
-                },
-                mc.team2: {
-                    "avg": mc.avg_score_2, "std": mc.std_score_2,
-                    "p10": mc.score_p10_2, "p50": mc.score_p50_2,
-                    "p90": mc.score_p90_2, "distribution": mc.score_dist_2,
-                },
-            },
-            "win_margins": {
-                "avg_runs":    mc.avg_win_margin_runs,
-                "avg_wickets": mc.avg_win_margin_wickets,
-            },
-            "batter_projections": mc.batter_projections,
-            "bowler_projections": mc.bowler_projections,
-            "confidence_interval_95": mc.confidence_interval_95,
+            "num_simulations":      mc.num_simulations,
+            "team1":                mc.team1,
+            "team2":                mc.team2,
+            "team1_win_pct":        mc.team1_win_pct,
+            "team2_win_pct":        mc.team2_win_pct,
+            "tie_pct":              mc.tie_pct,
+            "most_probable_winner": most_probable_winner,
+            "winner_confidence":    winner_pct,
+            "avg_score_team1":      mc.score_1["mean"],
+            "avg_score_team2":      mc.score_2["mean"],
+            "score_1":              mc.score_1,
+            "score_2":              mc.score_2,
+            "top3_batters":         top3_batters,
+            "top3_bowlers":         top3_bowlers,
+            "player_summaries":     mc.player_summaries,
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        import traceback
+        raise HTTPException(status_code=500, detail=f"{e}\n{traceback.format_exc()}")
 
-@app.post("/optimize/batting-order")
-def optimize_batting(req: OptimizeOrderRequest):
-    mc = _build_mock_mc(req.team1, req.team2,
-                        req.batter_projections, req.bowler_projections)
-    players = [Player(**p.dict()) for p in req.players]
-    order   = optimize_batting_order(players, mc)
-    return {"batting_order": order}
-
-
-@app.post("/optimize/bowling-rotation")
-def optimize_bowling(req: OptimizeOrderRequest):
-    mc = _build_mock_mc(req.team1, req.team2,
-                        req.batter_projections, req.bowler_projections)
-    players = [Player(**p.dict()) for p in req.players]
-    bowlers  = [p for p in players if p.role in ("BOWL", "AR")]
-    rotation = optimize_bowling_rotation(bowlers, mc)
-    return {"bowling_rotation": rotation}
-
-
-@app.post("/optimize/dream11")
-def optimize_dream11(req: Dream11Request):
-    mc = _build_mock_mc(req.mc_result_team1, req.mc_result_team2,
-                        req.batter_projections, req.bowler_projections)
-    players  = [Player(**p.dict()) for p in req.players]
-    team, score = dream11_optimize(players, mc, budget=req.budget)
-    return {
-        "selected_players":       [p.name for p in team],
-        "total_credits":          sum(p.credits for p in team),
-        "expected_fantasy_points": score,
-        "player_details":         [p.__dict__ for p in team],
-    }
-
-"""
 @app.post("/predict-ball")
 def predict_ball(ball_context: dict):
     """Raw ball probability prediction — useful for debugging."""
