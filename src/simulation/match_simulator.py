@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from src.model.predictor import load_predictor
-from src.simulation.player_profiles import apply_collapse_adjustment
+from src.simulation.player_profiles import apply_collapse_adjustment, apply_poor_batter_filter
 
 # ── Outcome encoding (for prev_ball_outcome features) ─────────────────────────
 _OUTCOME_ENCODE = {"0": 0, "1": 1, "2": 2, "3": 3, "4": 4, "6": 6, "W": 7}
@@ -825,6 +825,9 @@ class MatchSimulator:
                 # off the bat, so the model IS still called for that part.
                 probs = self.predictor.predict_proba(ctx)
                 probs = apply_collapse_adjustment(probs, state.wickets, over)
+                probs = apply_poor_batter_filter(
+                    probs, bs.get("bat_rw_avg", 26.0), bs.get("bat_rw_sr", 128.0)
+                )
                 bat_outcome = _sample_outcome(probs)
                 bat_runs, _, _, _ = _parse_outcome(bat_outcome)
                 runs, is_wicket, is_wide, is_noball = bat_runs, False, False, True
@@ -842,6 +845,9 @@ class MatchSimulator:
             else:
                 probs = self.predictor.predict_proba(ctx)
                 probs = apply_collapse_adjustment(probs, state.wickets, over)
+                probs = apply_poor_batter_filter(
+                    probs, bs.get("bat_rw_avg", 26.0), bs.get("bat_rw_sr", 128.0)
+                )
                 outcome = _sample_outcome(probs)
                 print("\n" + "=" * 70)
                 print(f"Ball : {over}.{ball_in_over}")

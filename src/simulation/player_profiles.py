@@ -28,6 +28,64 @@ from typing import Dict
 
 _MAX_TRANSFER = 0.06   # hard cap: at most 6 percentage points of probability moved
 
+# ── Poor-batter (tailender) filter ────────────────────────────────────────────
+# Thresholds on the SAME bat_rw_avg / bat_rw_sr features the model already
+# sees (via stats_store.batter(striker) — see match_simulator.py). A batter
+# whose recency-weighted average AND strike rate are both below these is a
+# genuine tailender-type batter, not just a slow starter. This only kicks in
+# for batters who are actually weak with the bat, career-long — not merely
+# below-average batters or players in early-career small samples.
+_POOR_AVG_THRESHOLD = 15.0    # bat_rw_avg below this counts as "poor"
+_POOR_SR_THRESHOLD  = 100.0   # bat_rw_sr below this counts as "poor"
+_POOR_MAX_TRANSFER  = 0.07    # slightly higher cap than collapse — this is a
+                              # persistent skill signal, not a transient one
+
+
+def apply_poor_batter_filter(probs: Dict[str, float], bat_rw_avg: float,
+                              bat_rw_sr: float) -> Dict[str, float]:
+    """
+    Dampens boundary-scoring probability for genuinely weak batters (e.g.
+    specialist bowlers with a poor batting record) and nudges the freed-up
+    mass mostly into dots, with a smaller share into wickets — reflecting
+    that a poor batter is more likely to block/miss than to find a gap for
+    four, and is somewhat more dismissal-prone than an average batter.
+
+    No-op unless BOTH bat_rw_avg and bat_rw_sr are below their thresholds.
+
+    Severity scales with how far below threshold the batter is (worse
+    average/SR -> bigger shift), capped at _POOR_MAX_TRANSFER so this never
+    dominates the model's own per-ball prediction.
+    """
+    if bat_rw_avg >= _POOR_AVG_THRESHOLD or bat_rw_sr >= _POOR_SR_THRESHOLD:
+        return probs
+
+    avg_deficit = max(0.0, (_POOR_AVG_THRESHOLD - bat_rw_avg) / _POOR_AVG_THRESHOLD)
+    sr_deficit  = max(0.0, (_POOR_SR_THRESHOLD - bat_rw_sr) / _POOR_SR_THRESHOLD)
+    severity = min((avg_deficit + sr_deficit) / 2, 1.0) * _POOR_MAX_TRANSFER
+
+    if severity <= 0:
+        return probs
+
+    p = dict(probs)
+    take_from = ["4", "6"]
+    give_to   = [("0", 0.75), ("W", 0.25)]
+
+    available = sum(p.get(k, 0.0) for k in take_from)
+    if available <= 0:
+        return probs
+    move = min(severity, available * 0.5)   # never drain a bucket below half itself
+
+    for k in take_from:
+        share = p.get(k, 0.0) / available
+        p[k] = max(0.0, p.get(k, 0.0) - move * share)
+    for k, w in give_to:
+        p[k] = p.get(k, 0.0) + move * w
+
+    total = sum(p.values())
+    if total <= 0:
+        return probs
+    return {k: v / total for k, v in p.items()}
+
 
 def apply_collapse_adjustment(probs: Dict[str, float], wickets_down: int,
                                over: int) -> Dict[str, float]:
