@@ -1,0 +1,75 @@
+# ==========================
+# Python
+# ==========================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# ==========================
+# Models
+# ==========================
+models/
+*.pkl
+*.joblib
+*.xgb
+
+# ==========================
+# Data
+# ==========================
+data/raw/
+data/processed/
+data/interim/
+
+# Keep folder structure if needed
+!data/.gitkeep
+
+# ==========================
+# Logs
+# ==========================
+*.log
+
+# ==========================
+# VS Code
+# ==========================
+.vscode/
+
+# ==========================
+# OS Files
+# ==========================
+.DS_Store
+Thumbs.db
+
+# ==========================
+# Node / React
+# ==========================
+webapp/node_modules/
+webapp/build/
+
+# npm
+package-lock.json
+
+# ==========================
+# Temporary files
+# ==========================
+*.tmp
+*.bak
+*.swp
+
+# ==========================
+# HTML exports
+# ==========================
+*.html
+
+# ==========================
+# Python cache anywhere
+# ==========================
+**/__pycache__/
+**/*.pyc
