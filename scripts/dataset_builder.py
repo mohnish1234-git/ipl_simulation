@@ -222,6 +222,499 @@ def _compute_actual_fantasy_points(cleaned: pd.DataFrame) -> pd.DataFrame:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Opportunity / role features
+# ═══════════════════════════════════════════════════════════════════════════
+# Skill stats (SR, average, economy, etc.) only tell you how good a player
+# is WHEN they get the ball. They say nothing about whether they'll actually
+# get 40 balls to face or 4 overs to bowl — and that opportunity is the
+# single biggest driver of raw fantasy points (a set batter who faces 10
+# balls scores less than a mediocre one who faces 50). Everything below is
+# built the same causal way as feature_engineer.py: sorted chronologically
+# per player, with `.shift(1)` before every rolling/expanding aggregate, so
+# a player's opportunity/form features for match N only ever see matches
+# STRICTLY BEFORE match N — never the match itself.
+#
+# Two roles CANNOT be derived from this data and are called out rather than
+# guessed: pace vs. spin (the raw schema has no bowler-style column) and
+# wicketkeeper (no fielder/keeper column). `player_role` below is therefore
+# limited to {batter, bowler, allrounder, unknown} based on batting/bowling
+# involvement volume — see its docstring.
+
+RECENT_FORM_WINDOWS = (5, 10)
+POWERPLAY_OVERS = (0, 5)   # over_num 0-5 inclusive
+DEATH_OVERS = (15, 19)     # over_num 15-19 inclusive
+WORKLOAD_WINDOW_DAYS = 14  # rolling window (days) for the recent-workload/fatigue count
+
+
+def _compute_match_involvement(cleaned: pd.DataFrame) -> pd.DataFrame:
+    """One row per (match_id, player) describing what actually happened in
+    that match — balls faced, overs bowled, batting position, phase usage,
+    team run/wicket share. This is the RAW per-match involvement data that
+    the causal rolling/expanding features below are built from; it is never
+    used directly as a model feature itself (it's post-match, same as
+    fantasy_points).
+    """
+    legal = cleaned[cleaned["is_legal"] == 1].copy()
+    legal["is_powerplay"] = legal["over_num"].between(*POWERPLAY_OVERS).astype(int)
+    legal["is_death"] = legal["over_num"].between(*DEATH_OVERS).astype(int)
+
+    # ── Batting involvement ──────────────────────────────────────────────
+    bat = legal.groupby(["match_id", "striker", "batting_team"]).agg(
+        balls_faced=("is_legal", "sum"),
+        runs_scored=("runs_of_bat", "sum"),
+        pp_balls_faced=("is_powerplay", "sum"),
+        death_balls_faced=("is_death", "sum"),
+    ).reset_index().rename(columns={"striker": "player", "batting_team": "team"})
+
+    # Batting position: order of first appearance at the crease within each
+    # (match, innings), sorted chronologically — a genuine pre-ball-known
+    # quantity once the match is underway, and highly stable match-to-match
+    # for a given player, which is exactly why history of it is predictive.
+    first_ball = (
+        legal.sort_values(["match_id", "innings", "over_num", "ball_num"])
+        .drop_duplicates(subset=["match_id", "innings", "striker"], keep="first")
+        .copy()
+    )
+    first_ball["batting_position"] = (
+        first_ball.groupby(["match_id", "innings"]).cumcount() + 1
+    )
+    bat = bat.merge(
+        first_ball[["match_id", "striker", "batting_position"]].rename(columns={"striker": "player"}),
+        on=["match_id", "player"], how="left",
+    )
+
+    # ── Bowling involvement ──────────────────────────────────────────────
+    bowl = legal.groupby(["match_id", "bowler", "bowling_team"]).agg(
+        balls_bowled=("is_legal", "sum"),
+        wickets_taken=("is_wicket", "sum"),
+        pp_balls_bowled=("is_powerplay", "sum"),
+        death_balls_bowled=("is_death", "sum"),
+    ).reset_index().rename(columns={"bowler": "player", "bowling_team": "team"})
+    bowl["overs_bowled"] = bowl["balls_bowled"] / 6.0
+    bowl["bowled_4_overs"] = (bowl["balls_bowled"] >= 24).astype(int)
+
+    # ── Team totals (for run share / wicket share) ───────────────────────
+    team_runs = legal.groupby(["match_id", "batting_team"])["total_runs"].sum().rename("team_runs").reset_index()
+    team_wkts = legal.groupby(["match_id", "bowling_team"])["is_wicket"].sum().rename("team_wickets").reset_index()
+
+    bat = bat.merge(team_runs, left_on=["match_id", "team"], right_on=["match_id", "batting_team"], how="left")
+    bat["run_share"] = np.where(bat["team_runs"] > 0, bat["runs_scored"] / bat["team_runs"], 0.0)
+
+    bowl = bowl.merge(team_wkts, left_on=["match_id", "team"], right_on=["match_id", "bowling_team"], how="left")
+    bowl["wicket_share"] = np.where(bowl["team_wickets"] > 0, bowl["wickets_taken"] / bowl["team_wickets"], 0.0)
+
+    involvement = bat[[
+        "match_id", "player", "team", "balls_faced", "runs_scored", "batting_position",
+        "pp_balls_faced", "death_balls_faced", "run_share",
+    ]].merge(
+        bowl[[
+            "match_id", "player", "team", "balls_bowled", "overs_bowled", "wickets_taken",
+            "bowled_4_overs", "pp_balls_bowled", "death_balls_bowled", "wicket_share",
+        ]],
+        on=["match_id", "player"], how="outer",
+        suffixes=("_bat", "_bowl"),
+    )
+    # A player's team is the same whichever side (bat/bowl) it came from —
+    # coalesce rather than pick one, since a pure bowler has no team_bat and
+    # a pure batter has no team_bowl.
+    involvement["team"] = involvement["team_bat"].combine_first(involvement["team_bowl"])
+    involvement = involvement.drop(columns=["team_bat", "team_bowl"])
+
+    num_cols = [c for c in involvement.columns if c not in ("match_id", "player", "team")]
+    involvement[num_cols] = involvement[num_cols].fillna(0)
+    return involvement
+
+
+def _compute_opportunity_role_features(involvement: pd.DataFrame,
+                                        actual_pts: pd.DataFrame,
+                                        match_meta: pd.DataFrame) -> pd.DataFrame:
+    """Turns raw per-match involvement + fantasy points into CAUSAL pre-match
+    opportunity/role/form features, one row per (match_id, player). Every
+    aggregate is `.shift(1)`-ed before the rolling/expanding window so it
+    only reflects matches strictly before the one being featurized.
+    """
+    df = involvement.merge(actual_pts[["match_id", "player", "fantasy_points"]],
+                            on=["match_id", "player"], how="left")
+    df = df.merge(match_meta, on="match_id", how="left")
+    df = df.sort_values(["player", "date", "match_id"]).reset_index(drop=True)
+
+    g = df.groupby("player", sort=False)
+
+    def causal_mean(col):
+        return g[col].apply(lambda s: s.shift(1).expanding().mean()).reset_index(level=0, drop=True)
+
+    def causal_rolling_mean(col, window):
+        return g[col].apply(lambda s: s.shift(1).rolling(window, min_periods=1).mean()).reset_index(level=0, drop=True)
+
+    def causal_std(col):
+        return g[col].apply(lambda s: s.shift(1).expanding().std()).reset_index(level=0, drop=True)
+
+    def causal_max(col):
+        return g[col].apply(lambda s: s.shift(1).expanding().max()).reset_index(level=0, drop=True)
+
+    def causal_min(col):
+        return g[col].apply(lambda s: s.shift(1).expanding().min()).reset_index(level=0, drop=True)
+
+    # ── Opportunity: batting position / opening probability ──────────────
+    df["avg_batting_position"] = causal_mean("batting_position")
+    df["_is_opener"] = (df["batting_position"] <= 2).astype(int)
+    df["opening_probability"] = causal_mean("_is_opener")
+    df.drop(columns=["_is_opener"], inplace=True)
+
+    # ── Opportunity: workload ─────────────────────────────────────────────
+    df["avg_balls_faced"] = causal_mean("balls_faced")
+    df["avg_overs_bowled"] = causal_mean("overs_bowled")
+    df["prob_bowling_4_overs"] = causal_mean("bowled_4_overs")
+
+    # ── Opportunity: phase usage share (of the balls a player faced/bowled,
+    # what fraction came in the powerplay / death overs — captures role
+    # within the innings, e.g. death-overs finisher vs. top-order anchor) ──
+    df["_pp_share_bat"] = np.where(df["balls_faced"] > 0, df["pp_balls_faced"] / df["balls_faced"], 0.0)
+    df["_death_share_bat"] = np.where(df["balls_faced"] > 0, df["death_balls_faced"] / df["balls_faced"], 0.0)
+    df["_pp_share_bowl"] = np.where(df["balls_bowled"] > 0, df["pp_balls_bowled"] / df["balls_bowled"], 0.0)
+    df["_death_share_bowl"] = np.where(df["balls_bowled"] > 0, df["death_balls_bowled"] / df["balls_bowled"], 0.0)
+    df["powerplay_usage_pct"] = causal_mean("_pp_share_bat") + causal_mean("_pp_share_bowl")
+    df["death_overs_usage_pct"] = causal_mean("_death_share_bat") + causal_mean("_death_share_bowl")
+    df.drop(columns=["_pp_share_bat", "_death_share_bat", "_pp_share_bowl", "_death_share_bowl"], inplace=True)
+
+    # ── Team contribution ─────────────────────────────────────────────────
+    df["avg_run_share"] = causal_mean("run_share")
+    df["avg_wicket_share"] = causal_mean("wicket_share")
+
+    # ── Recent fantasy form (last 5 / last 10 matches) ───────────────────
+    for w in RECENT_FORM_WINDOWS:
+        df[f"fantasy_form_last{w}"] = causal_rolling_mean("fantasy_points", w)
+
+    # ── Fantasy consistency + overall history ─────────────────────────────
+    df["career_avg_fantasy_points"] = causal_mean("fantasy_points")
+    df["career_std_fantasy_points"] = causal_std("fantasy_points").fillna(0)
+    df["career_ceiling_fantasy_points"] = causal_max("fantasy_points")
+    df["career_floor_fantasy_points"] = causal_min("fantasy_points")
+    df["career_matches_played"] = g.cumcount()
+
+    # ── Expected match involvement (composite workload share, 0-2) ────────
+    df["expected_match_involvement"] = (
+        df["avg_balls_faced"].fillna(0) / 20.0 + df["avg_overs_bowled"].fillna(0) / 4.0
+    )
+
+    # ── Workload / availability ─────────────────────────────────────────
+    # Days since last match needs no shift() of its own: it's the gap
+    # between THIS row's own match date and the player's PREVIOUS match
+    # date, which by construction can only ever look backward. A player's
+    # first-ever match has no previous date -> NaN -> filled with a
+    # neutral "well rested" default (30 days) rather than 0, which would
+    # misleadingly read as "played yesterday" for a debutant.
+    df["days_since_last_match"] = g["date"].diff().dt.days
+    df["days_since_last_match"] = df["days_since_last_match"].fillna(30.0)
+
+    def _matches_in_prior_window(dates: pd.Series, window_days: int) -> pd.Series:
+        vals = dates.values
+        out = np.empty(len(vals), dtype=int)
+        for i, d in enumerate(vals):
+            window_start = d - np.timedelta64(window_days, "D")
+            prior = vals[:i]
+            out[i] = int(((prior >= window_start) & (prior < d)).sum())
+        return pd.Series(out, index=dates.index)
+
+    # Recent-workload / fatigue proxy: how many matches the player has
+    # already played in the WORKLOAD_WINDOW_DAYS days strictly before this
+    # match (current match itself and anything after it excluded by
+    # construction — the window only ever looks at `prior`, i.e. dates
+    # before index i).
+    df[f"matches_last_{WORKLOAD_WINDOW_DAYS}_days"] = g["date"].apply(
+        lambda s: _matches_in_prior_window(s, WORKLOAD_WINDOW_DAYS)
+    ).reset_index(level=0, drop=True)
+
+    # Expected workload in balls (batting + bowling combined) — a simpler,
+    # more directly interpretable companion to expected_match_involvement's
+    # normalized 0-2 composite score.
+    df["expected_workload_balls"] = df["avg_balls_faced"].fillna(0) + df["avg_overs_bowled"].fillna(0) * 6.0
+
+    # ── Role classification (batter / bowler / allrounder / unknown) ──────
+    # Heuristic thresholds on CAUSAL prior totals (30 balls faced / 30 balls
+    # bowled ≈ 5 overs) — deliberately cannot distinguish pace/spin bowlers
+    # or flag wicketkeepers; the raw schema has no bowling-style or
+    # fielder/keeper column to derive either from (see module note above).
+    df["_prior_balls_faced_total"] = df.groupby("player")["balls_faced"].apply(
+        lambda s: s.shift(1).expanding().sum()).reset_index(level=0, drop=True)
+    df["_prior_balls_bowled_total"] = df.groupby("player")["balls_bowled"].apply(
+        lambda s: s.shift(1).expanding().sum()).reset_index(level=0, drop=True)
+
+    def _role(row):
+        bat_hist = row["_prior_balls_faced_total"]
+        bowl_hist = row["_prior_balls_bowled_total"]
+        if pd.isna(bat_hist) or pd.isna(bowl_hist) or (bat_hist == 0 and bowl_hist == 0):
+            return "unknown"
+        if bat_hist >= 30 and bowl_hist >= 30:
+            return "allrounder"
+        if bowl_hist >= 30:
+            return "bowler"
+        if bat_hist >= 30:
+            return "batter"
+        return "unknown"
+
+    df["player_role"] = df.apply(_role, axis=1)
+
+    # ── Richer sub-role: opener / top-order / middle-order / finisher for
+    # specialist batters, plus a split of "allrounder" into
+    # batting-leaning vs. bowling-leaning. NOTE: pace-vs-spin and
+    # wicketkeeper flags are NOT derivable from this data — same schema
+    # limitation called out in dataset_builder.py's fielding-points
+    # comment (no bowler-style or fielder/keeper column upstream) — so
+    # player_sub_role stays limited to batting-order + allrounder-lean
+    # roles. That's a real, if partial, upgrade over player_role above.
+    def _sub_role(row):
+        bat_hist = row["_prior_balls_faced_total"]
+        bowl_hist = row["_prior_balls_bowled_total"]
+        if pd.isna(bat_hist) or pd.isna(bowl_hist) or (bat_hist == 0 and bowl_hist == 0):
+            return "unknown"
+        if bat_hist >= 30 and bowl_hist >= 30:
+            return "batting_allrounder" if bat_hist >= bowl_hist else "bowling_allrounder"
+        if bowl_hist >= 30:
+            return "bowler"
+        if bat_hist >= 30:
+            pos = row["avg_batting_position"]
+            if pd.isna(pos):
+                return "batter"
+            if pos <= 2:
+                return "opener"
+            if pos <= 4:
+                return "top_order"
+            if pos <= 6:
+                return "middle_order"
+            return "finisher"
+        return "unknown"
+
+    df["player_sub_role"] = df.apply(_sub_role, axis=1)
+    df.drop(columns=["_prior_balls_faced_total", "_prior_balls_bowled_total"], inplace=True)
+
+    opportunity_cols = [
+        "match_id", "player",
+        "avg_batting_position", "opening_probability",
+        "avg_balls_faced", "avg_overs_bowled", "prob_bowling_4_overs",
+        "powerplay_usage_pct", "death_overs_usage_pct",
+        "avg_run_share", "avg_wicket_share",
+        *[f"fantasy_form_last{w}" for w in RECENT_FORM_WINDOWS],
+        "career_avg_fantasy_points", "career_std_fantasy_points",
+        "career_ceiling_fantasy_points", "career_floor_fantasy_points",
+        "career_matches_played", "expected_match_involvement", "player_role",
+        "player_sub_role", "days_since_last_match",
+        f"matches_last_{WORKLOAD_WINDOW_DAYS}_days", "expected_workload_balls",
+    ]
+    return df[opportunity_cols]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Team context / opposition-strength / venue-familiarity features
+# ═══════════════════════════════════════════════════════════════════════════
+# Everything above describes a player in isolation. It says nothing about
+# (a) how strong the player's OWN team is around them — a set batter in a
+# deep, powerful lineup gets fewer opportunities than the same batter as
+# their team's one reliable scorer, and a bowler on a side short of good
+# bowling options bowls more overs by default — or (b) how strong the
+# OPPOSITION is — the same skill nets more runs against a weak attack and
+# fewer wickets against a deep batting lineup, which the existing bvb_*
+# batter-vs-bowler columns don't capture at the team level. Built the same
+# causal way as everything else here: per (match, team) summaries, sorted
+# chronologically, `.shift(1)` before any rolling/expanding aggregate, so a
+# team's strength/venue-familiarity entering match N only reflects matches
+# STRICTLY BEFORE match N.
+
+TEAM_FORM_WINDOW = 10              # rolling window (matches) for team strength
+BATTING_DEPTH_BALL_THRESHOLD = 6   # min legal balls faced to count as a
+                                    # "contributing" batter for depth purposes
+
+
+def _compute_team_match_stats(cleaned: pd.DataFrame, match_meta: pd.DataFrame) -> pd.DataFrame:
+    """One row per (match_id, team): that team's own output IN that match —
+    runs scored, wickets lost batting, runs conceded, wickets taken
+    bowling, batting depth (# batters who reached
+    BATTING_DEPTH_BALL_THRESHOLD legal balls faced), bowling options (#
+    distinct bowlers used). This is POST-match, same as fantasy_points —
+    never used directly as a model feature, only as the input to the
+    causal rolling team-strength features below.
+    """
+    legal = cleaned[cleaned["is_legal"] == 1]
+
+    bat_side = legal.groupby(["match_id", "batting_team"]).agg(
+        runs_scored=("total_runs", "sum"),
+        wickets_lost=("is_wicket", "sum"),
+    ).reset_index().rename(columns={"batting_team": "team"})
+
+    per_batter_balls = (
+        legal.groupby(["match_id", "batting_team", "striker"])["is_legal"]
+        .sum().reset_index(name="balls_faced")
+    )
+    per_batter_balls["contributed"] = (
+        per_batter_balls["balls_faced"] >= BATTING_DEPTH_BALL_THRESHOLD
+    ).astype(int)
+    depth = (
+        per_batter_balls.groupby(["match_id", "batting_team"])["contributed"]
+        .sum().reset_index(name="batting_depth")
+        .rename(columns={"batting_team": "team"})
+    )
+
+    bowl_side = legal.groupby(["match_id", "bowling_team"]).agg(
+        runs_conceded=("total_runs", "sum"),
+        wickets_taken=("is_wicket", "sum"),
+    ).reset_index().rename(columns={"bowling_team": "team"})
+
+    options = (
+        legal.groupby(["match_id", "bowling_team"])["bowler"]
+        .nunique().reset_index(name="bowling_options")
+        .rename(columns={"bowling_team": "team"})
+    )
+
+    team_stats = bat_side.merge(depth, on=["match_id", "team"], how="left")
+    team_stats = team_stats.merge(bowl_side, on=["match_id", "team"], how="outer")
+    team_stats = team_stats.merge(options, on=["match_id", "team"], how="outer")
+    team_stats = team_stats.merge(match_meta, on="match_id", how="left")
+
+    num_cols = ["runs_scored", "wickets_lost", "batting_depth",
+                "runs_conceded", "wickets_taken", "bowling_options"]
+    team_stats[num_cols] = team_stats[num_cols].fillna(0)
+    return team_stats
+
+
+def _compute_team_strength_and_venue_features(team_stats: pd.DataFrame) -> pd.DataFrame:
+    """Causal, per (match_id, team) team-strength + venue-familiarity
+    features.
+
+    Team "home venue" isn't available as raw data (no team->city mapping
+    upstream, and the allowed-venue list mixes traditional home grounds
+    with newer neutral venues), so it's estimated causally from playing
+    history: at any point in time, a team's estimated home venue is
+    whichever venue it has played at MOST OFTEN SO FAR.
+    `is_estimated_home_venue` flags whether the CURRENT match's venue
+    matches that running estimate. This is a heuristic derived from the
+    data, not verified ground truth — called out explicitly rather than
+    silently presented as a real home/away field.
+    """
+    df = team_stats.sort_values(["team", "date", "match_id"]).reset_index(drop=True)
+    g = df.groupby("team", sort=False)
+
+    def causal_rolling_mean(col, window=TEAM_FORM_WINDOW):
+        return g[col].apply(
+            lambda s: s.shift(1).rolling(window, min_periods=1).mean()
+        ).reset_index(level=0, drop=True)
+
+    df["team_batting_strength"] = causal_rolling_mean("runs_scored")
+    # Lower = a STRONGER bowling unit (fewer runs conceded on average) —
+    # called out since, unlike every other "_strength" column here, higher
+    # is not better for this one.
+    df["team_bowling_strength"] = causal_rolling_mean("runs_conceded")
+    df["team_batting_depth"] = causal_rolling_mean("batting_depth")
+    df["team_bowling_options"] = causal_rolling_mean("bowling_options")
+
+    # Venue familiarity: how many matches this team has ALREADY played at
+    # this exact venue. cumcount() is 0 on a team's first-ever match at a
+    # venue — inherently prior-only, no extra shift needed.
+    df["team_venue_matches_played"] = df.groupby(["team", "venue"]).cumcount()
+
+    # Estimated home venue: an explicit running per-team venue counter, so
+    # "current" match is never included in its own estimate.
+    home_flags = pd.Series(0, index=df.index)
+    for _, idx in df.groupby("team", sort=False).groups.items():
+        venue_counts = {}
+        for i in idx:
+            v = df.at[i, "venue"]
+            home_venue = max(venue_counts, key=venue_counts.get) if venue_counts else None
+            home_flags.at[i] = int(v == home_venue)
+            venue_counts[v] = venue_counts.get(v, 0) + 1
+    df["is_estimated_home_venue"] = home_flags
+
+    keep = ["match_id", "team", "team_batting_strength", "team_bowling_strength",
+            "team_batting_depth", "team_bowling_options",
+            "team_venue_matches_played", "is_estimated_home_venue"]
+    return df[keep]
+
+
+def _attach_team_and_opposition_features(involvement: pd.DataFrame,
+                                          team_features: pd.DataFrame) -> pd.DataFrame:
+    """One row per (match_id, player): the player's OWN team's strength /
+    venue-familiarity features, plus the OPPOSING team's — a batter's
+    opposition context is the team's bowling strength/options they face; a
+    bowler's opposition context is the team's batting strength/depth they
+    bowl at. Captures matchup context beyond individual batter-vs-bowler
+    history (bvb_* columns), which only ever sees one bowler/batter at a
+    time, not the whole XI's overall strength.
+    """
+    player_team = involvement[["match_id", "player", "team"]].drop_duplicates(
+        subset=["match_id", "player"]
+    )
+
+    teams_per_match = (
+        team_features[["match_id", "team"]]
+        .drop_duplicates()
+        .groupby("match_id")["team"]
+        .apply(list)
+        .to_dict()
+    )
+
+    def opponent_of(row):
+        teams = teams_per_match.get(row["match_id"], [])
+        others = [t for t in teams if t != row["team"]]
+        return others[0] if others else None
+
+    player_team = player_team.copy()
+    player_team["opponent_team"] = player_team.apply(opponent_of, axis=1)
+
+    own_cols = {c: f"own_{c}" for c in team_features.columns if c not in ("match_id", "team")}
+    opp_cols = {c: f"opp_{c}" for c in team_features.columns if c not in ("match_id", "team")}
+
+    out = player_team.merge(
+        team_features.rename(columns=own_cols),
+        on=["match_id", "team"], how="left",
+    )
+    out = out.merge(
+        team_features.rename(columns={**opp_cols, "team": "opponent_team"}),
+        on=["match_id", "opponent_team"], how="left",
+    )
+    out = out.drop(columns=["team", "opponent_team"])
+
+    num_cols = [c for c in out.columns if c not in ("match_id", "player")]
+    out[num_cols] = out[num_cols].fillna(0)
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Cricket-specific interaction features
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _add_interaction_features(df: pd.DataFrame) -> pd.DataFrame:
+    """A handful of explicit interaction terms. XGBoost can in principle
+    learn feature interactions on its own via successive tree splits, but
+    handing it a well-chosen product directly makes a known domain
+    interaction available in ONE split instead of requiring the tree to
+    rediscover a multi-level split pattern from a finite, noisy sample.
+    Cheap to add; guarded with fillna(0) since this runs before
+    _validate_and_clean's own NaN pass.
+    """
+    def safe_mul(a, b):
+        return df[a].fillna(0) * df[b].fillna(0)
+
+    # Batting opportunity (balls likely faced) × underlying strike rate —
+    # fantasy upside needs BOTH a chance to bat and the skill to score
+    # fast once in, not either alone.
+    if {"avg_balls_faced", "bat_rw_sr"}.issubset(df.columns):
+        df["batting_opportunity_x_sr"] = safe_mul("avg_balls_faced", "bat_rw_sr")
+
+    # Bowling workload (overs likely to bowl) × wicket-taking ability — a
+    # strike bowler who only gets 1 over has a capped wicket ceiling; a
+    # containment bowler who bowls all 4 overs still won't rack up wickets.
+    if {"avg_overs_bowled", "bowl_rw_wicket_pct"}.issubset(df.columns):
+        df["bowling_workload_x_wicket_pct"] = safe_mul("avg_overs_bowled", "bowl_rw_wicket_pct")
+
+    # Opening probability × how much this venue historically favors 1st
+    # innings scoring — an opener's fantasy ceiling is much higher at a
+    # high-scoring venue than a slow, low-scoring one.
+    if {"opening_probability", "venue_rw_avg_1st_innings"}.issubset(df.columns):
+        df["opening_prob_x_venue_scoring"] = safe_mul("opening_probability", "venue_rw_avg_1st_innings")
+
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Pre-match feature snapshot (one row per player per match)
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -274,7 +767,7 @@ def _validate_and_clean(df: pd.DataFrame) -> pd.DataFrame:
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     numeric_cols = [c for c in numeric_cols if c not in
                     ("match_id", "season", "batting_points", "bowling_points",
-                     "fielding_points", "fantasy_points")]
+                     "fielding_points", "fantasy_points", "career_matches_played")]
 
     all_na_mask = df[numeric_cols].isna().all(axis=1) if numeric_cols else pd.Series(False, index=df.index)
     dropped = int(all_na_mask.sum())
@@ -338,11 +831,29 @@ def build_dataset() -> pd.DataFrame:
     actual_pts = _compute_actual_fantasy_points(cleaned)
     print(f"  {len(actual_pts):,} (match, player) actual-points rows")
 
-    print("\nStep 5: joining features (X) with actual points (y) …")
+    print("\nStep 5: computing opportunity / role / recent-form features …")
+    involvement = _compute_match_involvement(cleaned)
+    match_meta = cleaned[["match_id", "date", "season", "venue"]].drop_duplicates(subset=["match_id"])
+    opportunity = _compute_opportunity_role_features(involvement, actual_pts, match_meta[["match_id", "date"]])
+    print(f"  {len(opportunity):,} (match, player) opportunity-feature rows")
+
+    print("\nStep 6: computing team-strength / opposition-strength / venue-familiarity features …")
+    team_stats = _compute_team_match_stats(cleaned, match_meta)
+    team_features = _compute_team_strength_and_venue_features(team_stats)
+    team_opposition = _attach_team_and_opposition_features(involvement, team_features)
+    print(f"  {len(team_opposition):,} (match, player) team/opposition-feature rows")
+
+    print("\nStep 7: joining skill features (X) + opportunity features (X) + team/opposition "
+          "features (X) + actual points (y) …")
     dataset = pre_match.merge(actual_pts, on=["match_id", "player"], how="inner")
+    dataset = dataset.merge(opportunity, on=["match_id", "player"], how="left")
+    dataset = dataset.merge(team_opposition, on=["match_id", "player"], how="left")
     print(f"  {len(dataset):,} joined rows")
 
-    print("\nStep 6: validating + cleaning …")
+    print("\nStep 8: adding cricket-specific interaction features …")
+    dataset = _add_interaction_features(dataset)
+
+    print("\nStep 9: validating + cleaning …")
     dataset = _validate_and_clean(dataset)
 
     print(f"\nFinal fantasy dataset shape: {dataset.shape}")
