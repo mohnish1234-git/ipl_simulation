@@ -357,6 +357,11 @@ def _compute_opportunity_role_features(involvement: pd.DataFrame,
 
     # ── Opportunity: batting position / opening probability ──────────────
     df["avg_batting_position"] = causal_mean("batting_position")
+    # Role/positional CONSISTENCY — a player nailed into one slot is a far
+    # more predictable fantasy source than one whose role has been
+    # shuffled recently; std is a genuinely different signal from the mean
+    # above, not a duplicate of it.
+    df["batting_position_std"] = causal_std("batting_position").fillna(0)
     df["_is_opener"] = (df["batting_position"] <= 2).astype(int)
     df["opening_probability"] = causal_mean("_is_opener")
     df.drop(columns=["_is_opener"], inplace=True)
@@ -391,6 +396,17 @@ def _compute_opportunity_role_features(involvement: pd.DataFrame,
     df["career_ceiling_fantasy_points"] = causal_max("fantasy_points")
     df["career_floor_fantasy_points"] = causal_min("fantasy_points")
     df["career_matches_played"] = g.cumcount()
+
+    # Most-recent-match points, kept SEPARATE from the smoothed rolling
+    # averages above — a single recent big score/failure is real signal a
+    # multi-match average dilutes away, and "hot/cold right now" is a
+    # different question from "good on average."
+    df["last_match_fantasy_points"] = g["fantasy_points"].shift(1)
+
+    # Form trend: is the player currently running hotter or colder than
+    # their own career average? (fantasy_form_last5 is assigned above in
+    # the RECENT_FORM_WINDOWS loop, so it's already available here.)
+    df["form_trend"] = df["fantasy_form_last5"] - df["career_avg_fantasy_points"]
 
     # ── Expected match involvement (composite workload share, 0-2) ────────
     df["expected_match_involvement"] = (
@@ -429,6 +445,33 @@ def _compute_opportunity_role_features(involvement: pd.DataFrame,
     # more directly interpretable companion to expected_match_involvement's
     # normalized 0-2 composite score.
     df["expected_workload_balls"] = df["avg_balls_faced"].fillna(0) + df["avg_overs_bowled"].fillna(0) * 6.0
+
+    # ── Rate stat + explicit projection formula ───────────────────────────
+    # career_avg_fantasy_points blends "great player, rarely used" and
+    # "average player, huge opportunity" into the same number — it can't
+    # tell skill-per-chance apart from how many chances the player gets.
+    # fantasy_points_per_involvement_ball is a genuine RATE (points per
+    # ball of batting+bowling involvement, sum-of-points over sum-of-balls
+    # across a player's causal history — not an average of per-match
+    # ratios, which would let low-involvement matches dominate the number).
+    # Multiplying that rate by expected_workload_balls turns "how good per
+    # opportunity" and "how much opportunity" back into a single explicit
+    # projected-points prior, instead of leaving the tree to rediscover
+    # that multiplication from two separate columns on its own.
+    df["_involvement_balls"] = df["balls_faced"] + df["balls_bowled"]
+
+    def causal_rate(num_col, den_col):
+        num_cum = g[num_col].apply(lambda s: s.shift(1).expanding().sum()).reset_index(level=0, drop=True)
+        den_cum = g[den_col].apply(lambda s: s.shift(1).expanding().sum()).reset_index(level=0, drop=True)
+        return np.where(den_cum > 0, num_cum / den_cum, np.nan)
+
+    df["fantasy_points_per_involvement_ball"] = causal_rate("fantasy_points", "_involvement_balls")
+    df.drop(columns=["_involvement_balls"], inplace=True)
+
+    df["expected_fantasy_points_prior"] = (
+        pd.Series(df["fantasy_points_per_involvement_ball"], index=df.index).fillna(0)
+        * df["expected_workload_balls"]
+    )
 
     # ── Role classification (batter / bowler / allrounder / unknown) ──────
     # Heuristic thresholds on CAUSAL prior totals (30 balls faced / 30 balls
@@ -490,16 +533,18 @@ def _compute_opportunity_role_features(involvement: pd.DataFrame,
 
     opportunity_cols = [
         "match_id", "player",
-        "avg_batting_position", "opening_probability",
+        "avg_batting_position", "batting_position_std", "opening_probability",
         "avg_balls_faced", "avg_overs_bowled", "prob_bowling_4_overs",
         "powerplay_usage_pct", "death_overs_usage_pct",
         "avg_run_share", "avg_wicket_share",
         *[f"fantasy_form_last{w}" for w in RECENT_FORM_WINDOWS],
         "career_avg_fantasy_points", "career_std_fantasy_points",
         "career_ceiling_fantasy_points", "career_floor_fantasy_points",
-        "career_matches_played", "expected_match_involvement", "player_role",
+        "career_matches_played", "last_match_fantasy_points", "form_trend",
+        "expected_match_involvement", "player_role",
         "player_sub_role", "days_since_last_match",
         f"matches_last_{WORKLOAD_WINDOW_DAYS}_days", "expected_workload_balls",
+        "fantasy_points_per_involvement_ball", "expected_fantasy_points_prior",
     ]
     return df[opportunity_cols]
 
@@ -629,15 +674,12 @@ def _compute_team_strength_and_venue_features(team_stats: pd.DataFrame) -> pd.Da
     return df[keep]
 
 
-def _attach_team_and_opposition_features(involvement: pd.DataFrame,
-                                          team_features: pd.DataFrame) -> pd.DataFrame:
-    """One row per (match_id, player): the player's OWN team's strength /
-    venue-familiarity features, plus the OPPOSING team's — a batter's
-    opposition context is the team's bowling strength/options they face; a
-    bowler's opposition context is the team's batting strength/depth they
-    bowl at. Captures matchup context beyond individual batter-vs-bowler
-    history (bvb_* columns), which only ever sees one bowler/batter at a
-    time, not the whole XI's overall strength.
+def _build_player_opponent_map(involvement: pd.DataFrame,
+                                team_features: pd.DataFrame) -> pd.DataFrame:
+    """One row per (match_id, player): the player's own team plus the
+    OPPOSING team for that match. Shared by _attach_team_and_opposition_
+    features and _compute_matchup_history_features so the "which team did
+    this player face" logic exists in exactly one place.
     """
     player_team = involvement[["match_id", "player", "team"]].drop_duplicates(
         subset=["match_id", "player"]
@@ -658,6 +700,20 @@ def _attach_team_and_opposition_features(involvement: pd.DataFrame,
 
     player_team = player_team.copy()
     player_team["opponent_team"] = player_team.apply(opponent_of, axis=1)
+    return player_team
+
+
+def _attach_team_and_opposition_features(involvement: pd.DataFrame,
+                                          team_features: pd.DataFrame) -> pd.DataFrame:
+    """One row per (match_id, player): the player's OWN team's strength /
+    venue-familiarity features, plus the OPPOSING team's — a batter's
+    opposition context is the team's bowling strength/options they face; a
+    bowler's opposition context is the team's batting strength/depth they
+    bowl at. Captures matchup context beyond individual batter-vs-bowler
+    history (bvb_* columns), which only ever sees one bowler/batter at a
+    time, not the whole XI's overall strength.
+    """
+    player_team = _build_player_opponent_map(involvement, team_features)
 
     own_cols = {c: f"own_{c}" for c in team_features.columns if c not in ("match_id", "team")}
     opp_cols = {c: f"opp_{c}" for c in team_features.columns if c not in ("match_id", "team")}
@@ -675,6 +731,57 @@ def _attach_team_and_opposition_features(involvement: pd.DataFrame,
     num_cols = [c for c in out.columns if c not in ("match_id", "player")]
     out[num_cols] = out[num_cols].fillna(0)
     return out
+
+
+# Shrinkage constant (in PRIOR matches vs this specific opponent) for the
+# head-to-head fantasy-points feature below. With this many prior meetings,
+# the raw head-to-head average sits halfway between itself and the
+# player's overall career average; below that it leans toward the career
+# number, since a handful of matches against one specific opponent is a
+# noisy sample on its own (same K/(K+n) shrinkage style used throughout
+# feature_engineer.py for the same reason).
+OPPONENT_HISTORY_SHRINK_K = 5.0
+
+
+def _compute_matchup_history_features(involvement: pd.DataFrame,
+                                       actual_pts: pd.DataFrame,
+                                       match_meta: pd.DataFrame,
+                                       team_features: pd.DataFrame,
+                                       opportunity: pd.DataFrame) -> pd.DataFrame:
+    """One row per (match_id, player): this player's own causal history of
+    fantasy points SPECIFICALLY against the upcoming opponent — different
+    from opp_team_batting_strength/opp_team_bowling_strength (the
+    opponent's general quality), this is "how has THIS player personally
+    done against THIS opponent before." Shrunk toward the player's overall
+    career average at low sample size (see OPPONENT_HISTORY_SHRINK_K)
+    since most player/opponent pairings only have a handful of meetings.
+    """
+    df = _build_player_opponent_map(involvement, team_features)
+    df = df.merge(actual_pts[["match_id", "player", "fantasy_points"]],
+                   on=["match_id", "player"], how="left")
+    df = df.merge(match_meta, on="match_id", how="left")
+    df = df.merge(opportunity[["match_id", "player", "career_avg_fantasy_points"]],
+                   on=["match_id", "player"], how="left")
+    df = df.sort_values(["player", "opponent_team", "date", "match_id"]).reset_index(drop=True)
+
+    g2 = df.groupby(["player", "opponent_team"], sort=False)
+    # cumcount() is inherently prior-only (0 on the first-ever meeting) —
+    # no extra shift needed, same reasoning as team_venue_matches_played.
+    df["matches_vs_opponent_played"] = g2.cumcount()
+    raw_avg_vs_opp = g2["fantasy_points"].apply(
+        lambda s: s.shift(1).expanding().mean()
+    ).reset_index(level=[0, 1], drop=True)
+
+    n = df["matches_vs_opponent_played"].astype(float)
+    weight = n / (n + OPPONENT_HISTORY_SHRINK_K)
+    prior = df["career_avg_fantasy_points"].fillna(0)
+    df["fantasy_points_vs_opponent"] = np.where(
+        n > 0,
+        raw_avg_vs_opp.fillna(prior) * weight + prior * (1 - weight),
+        prior,
+    )
+
+    return df[["match_id", "player", "fantasy_points_vs_opponent", "matches_vs_opponent_played"]]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -843,11 +950,18 @@ def build_dataset() -> pd.DataFrame:
     team_opposition = _attach_team_and_opposition_features(involvement, team_features)
     print(f"  {len(team_opposition):,} (match, player) team/opposition-feature rows")
 
+    print("\nStep 6b: computing player-vs-opponent head-to-head fantasy history …")
+    matchup_history = _compute_matchup_history_features(
+        involvement, actual_pts, match_meta[["match_id", "date"]], team_features, opportunity
+    )
+    print(f"  {len(matchup_history):,} (match, player) matchup-history rows")
+
     print("\nStep 7: joining skill features (X) + opportunity features (X) + team/opposition "
-          "features (X) + actual points (y) …")
+          "features (X) + matchup-history features (X) + actual points (y) …")
     dataset = pre_match.merge(actual_pts, on=["match_id", "player"], how="inner")
     dataset = dataset.merge(opportunity, on=["match_id", "player"], how="left")
     dataset = dataset.merge(team_opposition, on=["match_id", "player"], how="left")
+    dataset = dataset.merge(matchup_history, on=["match_id", "player"], how="left")
     print(f"  {len(dataset):,} joined rows")
 
     print("\nStep 8: adding cricket-specific interaction features …")
