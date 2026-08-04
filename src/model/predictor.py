@@ -121,7 +121,19 @@ class BallOutcomePredictor:
             dmat  = xgb.DMatrix(X, feature_names=self.feature_cols, enable_categorical=True)
             probs = self.booster.predict(dmat)[0]
         else:
-            probs = self.model.predict_proba(X)[0]
+            # Legacy pkl path: do NOT call self.model.predict_proba(X)
+            # directly. XGBoost's sklearn wrapper does its own strict dtype
+            # validation and raises "DataFrame.dtypes for data must be int,
+            # float, bool or category ... enable_categorical must be set to
+            # True" for category-dtype columns unless the estimator itself
+            # was constructed with enable_categorical=True — which a bare
+            # joblib.load() doesn't guarantee survived pickling, or matches
+            # this xgboost version's expectations. Go through the
+            # underlying booster + an explicit DMatrix instead, exactly
+            # like the JSON path above, which bypasses that sklearn-side
+            # validation entirely.
+            dmat  = xgb.DMatrix(X, feature_names=self.feature_cols, enable_categorical=True)
+            probs = self.model.get_booster().predict(dmat)[0]
 
         classes = self.label_encoder.classes_
         # Filter to only the outcomes the simulator understands, then
