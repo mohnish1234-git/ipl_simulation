@@ -1,7 +1,8 @@
 import axios from "axios";
 
-// The baseURL is empty because package.json specifies "proxy": "http://localhost:8000"
-// Axios requests will automatically fall back to the proxy during development.
+// package.json uses:
+// "proxy": "http://localhost:8000"
+
 const api = axios.create({
   baseURL: "",
 });
@@ -16,22 +17,9 @@ export const simulateMatch = async (data) => {
   return res.data;
 };
 
-export const runMonteCarlo = async (data) => {
-  const res = await api.post("/monte-carlo", data);
+export const predictFantasyXI = async (data) => {
+  const res = await api.post("/predict-fantasy-xi", data);
   return res.data;
 };
 
-export const optimizeBat = async (data) => {
-  const res = await api.post("/optimize/batting-order", data);
-  return res.data;
-};
-
-export const optimizeBowl = async (data) => {
-  const res = await api.post("/optimize/bowling-rotation", data);
-  return res.data;
-};
-
-export const optimizeDream11 = async (data) => {
-  const res = await api.post("/optimize/dream11", data);
-  return res.data;
-};
+export default api;

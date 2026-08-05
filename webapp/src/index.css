@@ -1,0 +1,607 @@
+/* ==========================================================
+   IPL Fantasy XI Predictor
+   Modern Dark Theme
+   ========================================================== */
+
+*,
+*::before,
+*::after {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+:root {
+    --background: #0b0b0b;
+    --surface: #141414;
+    --surface-light: #1c1c1c;
+    --border: #2a2a2a;
+
+    --primary: #ffffff;
+    --secondary: #b5b5b5;
+    --muted: #7d7d7d;
+
+    --accent: #ffffff;
+    --accent-hover: #f2f2f2;
+
+    --success: #4ade80;
+    --warning: #facc15;
+    --danger: #ef4444;
+
+    --shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
+
+    --radius-sm: 8px;
+    --radius-md: 12px;
+    --radius-lg: 18px;
+
+    --transition: all .25s ease;
+}
+
+body {
+    background: var(--background);
+    color: var(--primary);
+    font-family: "Inter", sans-serif;
+    line-height: 1.6;
+}
+
+#root {
+    min-height: 100vh;
+}
+
+/* ==========================================================
+   APP
+   ========================================================== */
+
+.app {
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+}
+
+/* ==========================================================
+   NAVBAR
+   ========================================================== */
+
+.navbar {
+    position: sticky;
+    top: 0;
+    z-index: 999;
+
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+
+    padding: 0 36px;
+    height: 72px;
+
+    background: rgba(10, 10, 10, .95);
+    backdrop-filter: blur(16px);
+
+    border-bottom: 1px solid var(--border);
+}
+
+.nav-brand {
+    font-size: 1.35rem;
+    font-weight: 700;
+    letter-spacing: -.02em;
+}
+
+.nav-links {
+    display: flex;
+    gap: 24px;
+}
+
+.nav-links a {
+    text-decoration: none;
+    color: var(--secondary);
+    transition: var(--transition);
+    font-weight: 500;
+}
+
+.nav-links a:hover {
+    color: var(--primary);
+}
+
+.nav-links a.active {
+    color: var(--primary);
+}
+
+/* ==========================================================
+   MAIN
+   ========================================================== */
+
+.main-content {
+    width: 100%;
+    max-width: 1500px;
+    margin: auto;
+    padding: 40px;
+}
+
+/* ==========================================================
+   CARD
+   ========================================================== */
+
+.card {
+    background: var(--surface);
+
+    border: 1px solid var(--border);
+
+    border-radius: var(--radius-lg);
+
+    padding: 28px;
+
+    margin-bottom: 28px;
+
+    box-shadow: var(--shadow);
+
+    transition: var(--transition);
+}
+
+.card:hover {
+    border-color: #3b3b3b;
+}
+
+.card h1,
+.card h2,
+.card h3 {
+    margin-bottom: 18px;
+}
+
+.card h1 {
+    font-size: 2rem;
+}
+
+.card h2 {
+    font-size: 1.25rem;
+}
+
+.card h3 {
+    font-size: 1rem;
+    color: var(--secondary);
+}
+
+/* ==========================================================
+   GRID
+   ========================================================== */
+
+.grid-2 {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 24px;
+}
+
+.grid-3 {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 20px;
+}
+
+.grid-4 {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 20px;
+}
+
+@media(max-width:1000px) {
+
+    .grid-2,
+    .grid-3,
+    .grid-4 {
+        grid-template-columns: 1fr;
+    }
+
+    .main-content {
+        padding: 20px;
+    }
+
+}
+
+/* ==========================================================
+   FORM
+   ========================================================== */
+
+.field {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+label {
+    font-size: .85rem;
+    font-weight: 600;
+    color: var(--secondary);
+}
+
+input,
+select,
+textarea {
+
+    background: #111;
+
+    color: white;
+
+    border: 1px solid var(--border);
+
+    border-radius: 12px;
+
+    padding: 12px 14px;
+
+    font-size: .95rem;
+
+    transition: var(--transition);
+
+    outline: none;
+
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+
+    border-color: white;
+
+}
+
+/* ==========================================================
+   BUTTONS
+   ========================================================== */
+
+.btn {
+
+    border: none;
+
+    cursor: pointer;
+
+    padding: 12px 22px;
+
+    border-radius: 12px;
+
+    font-size: .95rem;
+
+    font-weight: 600;
+
+    transition: var(--transition);
+
+}
+
+.btn-primary {
+
+    background: white;
+
+    color: black;
+
+}
+
+.btn-primary:hover {
+
+    background: #dcdcdc;
+
+    transform: translateY(-2px);
+
+}
+
+.btn-secondary {
+
+    background: #202020;
+
+    color: white;
+
+}
+
+.btn-secondary:hover {
+
+    background: #2d2d2d;
+
+}
+
+.btn:disabled {
+
+    opacity: .55;
+
+    cursor: not-allowed;
+
+    transform: none;
+
+}
+
+/* ==========================================================
+   TEAM BUILDER
+   ========================================================== */
+
+.team-builder {
+
+    display: flex;
+
+    flex-direction: column;
+
+    gap: 18px;
+
+}
+
+/* ==========================================================
+   TABLE
+   ========================================================== */
+
+table {
+
+    width: 100%;
+
+    border-collapse: collapse;
+
+    margin-top: 15px;
+
+}
+
+thead {
+
+    background: #1a1a1a;
+
+}
+
+th {
+
+    padding: 14px;
+
+    font-size: .9rem;
+
+    text-align: left;
+
+    color: #d1d1d1;
+
+    border-bottom: 1px solid var(--border);
+
+}
+
+td {
+
+    padding: 14px;
+
+    border-bottom: 1px solid #202020;
+
+}
+
+tbody tr {
+
+    transition: var(--transition);
+
+}
+
+tbody tr:hover {
+
+    background: #181818;
+
+}
+
+/* ==========================================================
+   BADGES
+   ========================================================== */
+
+.badge {
+
+    display: inline-block;
+
+    padding: 4px 12px;
+
+    border-radius: 999px;
+
+    font-size: .75rem;
+
+    font-weight: 600;
+
+}
+
+.badge-win {
+
+    background: #12311d;
+
+    color: var(--success);
+
+}
+
+.badge-loss {
+
+    background: #381212;
+
+    color: var(--danger);
+
+}
+
+/* ==========================================================
+   STATS
+   ========================================================== */
+
+.stat-box {
+
+    background: #111;
+
+    border: 1px solid var(--border);
+
+    border-radius: 16px;
+
+    padding: 24px;
+
+    text-align: center;
+
+}
+
+.stat-box .val {
+
+    font-size: 2rem;
+
+    font-weight: 700;
+
+    margin-bottom: 6px;
+
+}
+
+.stat-box .lbl {
+
+    font-size: .85rem;
+
+    color: var(--secondary);
+
+}
+
+/* ==========================================================
+   LOADING
+   ========================================================== */
+
+.loading {
+
+    display: flex;
+
+    flex-direction: column;
+
+    justify-content: center;
+
+    align-items: center;
+
+    padding: 60px;
+
+    gap: 15px;
+
+    color: var(--secondary);
+
+}
+
+.spinner {
+
+    width: 42px;
+
+    height: 42px;
+
+    border-radius: 50%;
+
+    border: 4px solid #2a2a2a;
+
+    border-top: 4px solid white;
+
+    animation: spin .8s linear infinite;
+
+}
+
+@keyframes spin {
+
+    100% {
+
+        transform: rotate(360deg);
+
+    }
+
+}
+
+/* ==========================================================
+   PROGRESS BAR
+   ========================================================== */
+
+.prob-bar-wrap {
+
+    margin-bottom: 14px;
+
+}
+
+.prob-bar-label {
+
+    display: flex;
+
+    justify-content: space-between;
+
+    margin-bottom: 5px;
+
+    font-size: .85rem;
+
+    color: var(--secondary);
+
+}
+
+.prob-bar-track {
+
+    height: 10px;
+
+    background: #1f1f1f;
+
+    border-radius: 999px;
+
+    overflow: hidden;
+
+}
+
+.prob-bar-fill {
+
+    height: 100%;
+
+    background: white;
+
+    transition: .5s;
+
+}
+
+.prob-bar-fill.team2 {
+
+    background: #bdbdbd;
+
+}
+
+/* ==========================================================
+   SECTION TITLE
+   ========================================================== */
+
+.section-title {
+
+    font-size: .8rem;
+
+    font-weight: 700;
+
+    text-transform: uppercase;
+
+    letter-spacing: .08em;
+
+    color: #8c8c8c;
+
+    margin-bottom: 12px;
+
+}
+
+/* ==========================================================
+   META
+   ========================================================== */
+
+.meta-status {
+
+    margin-bottom: 15px;
+
+    color: var(--secondary);
+
+    font-size: .9rem;
+
+}
+
+.meta-status.warning {
+
+    color: var(--warning);
+
+}
+
+/* ==========================================================
+   SCROLLBAR
+   ========================================================== */
+
+::-webkit-scrollbar {
+
+    width: 8px;
+
+}
+
+::-webkit-scrollbar-thumb {
+
+    background: #2e2e2e;
+
+    border-radius: 20px;
+
+}
+
+::-webkit-scrollbar-track {
+
+    background: #111;
+
+}
